@@ -166,20 +166,32 @@ always_ff @(posedge clk_49m) begin
 	end
 end
 
+// Generate falling-edge enables for KONAMI1/mc6809is core
+reg cpu_E_last = 0;
+reg cpu_Q_last = 0;
+wire fallE_en = cpu_E_last & ~cpu_E;  // One-cycle pulse on falling edge of E
+wire fallQ_en = cpu_Q_last & ~cpu_Q;  // One-cycle pulse on falling edge of Q
+always_ff @(posedge clk_49m) begin
+	cpu_E_last <= cpu_E;
+	cpu_Q_last <= cpu_Q;
+end
+
 //------------------------------------------------------------ CPUs ------------------------------------------------------------//
 
-//Primary CPU - Motorola MC6809E
+//Primary CPU — KONAMI-1 (encrypted MC6809E)
 wire [15:0] cpu_A;
 wire [7:0] cpu_Dout;
 wire cpu_RnW;
-mc6809e E3
+
+KONAMI1 E3
 (
-	.D(cpu_Din),
+	.CLK(clk_49m),
+	.fallE_en(fallE_en),
+	.fallQ_en(fallQ_en),
+	.D(cpu_Din),         // Raw bus data — KONAMI1 handles decryption internally
 	.DOut(cpu_Dout),
 	.ADDR(cpu_A),
 	.RnW(cpu_RnW),
-	.E(cpu_E),
-	.Q(cpu_Q),
 	.nIRQ(n_irq),
 	.nFIRQ(1'b1),
 	.nNMI(1'b1),
@@ -187,35 +199,10 @@ mc6809e E3
 	.BA(),
 	.AVMA(),
 	.BUSY(),
-	.LIC(cpu_LIC),
+	.LIC(),
 	.nHALT(1'b1),
 	.nRESET(reset)
 );
-
-// Konami-1 opcode decryption
-// The Konami-1 is a 6809 with XOR encryption on opcode fetches only.
-// We use the LIC (Last Instruction Cycle) signal: when LIC was high on the
-// previous E-rising edge, the current bus read is an opcode fetch.
-wire cpu_LIC;  // Connected to .LIC() port of mc6809e above
-
-reg lic_delayed = 0;
-reg opcode_fetch = 0;
-always_ff @(posedge clk_49m) begin
-	if(!reset) begin
-		lic_delayed <= 0;
-		opcode_fetch <= 0;
-	end
-	else if(cpu_E && !cpu_Q) begin
-		lic_delayed <= cpu_LIC;
-		opcode_fetch <= lic_delayed;
-	end
-end
-
-// XOR mask based on address bits 3 and 1 only (MAME: adr & 0xA)
-wire [7:0] konami1_xor = ({cpu_A[3], cpu_A[1]} == 2'b00) ? 8'h22 :
-                         ({cpu_A[3], cpu_A[1]} == 2'b01) ? 8'h82 :
-                         ({cpu_A[3], cpu_A[1]} == 2'b10) ? 8'h28 :
-                                                           8'h88;
 
 //------------------------------------------------------ Address decoding ------------------------------------------------------//
 
@@ -413,27 +400,19 @@ end
 
 // I/O registers must be checked first (they're in the 0x8000-0x87FF range)
 // Controls/DIP data comes from the sound board via controls_dip
-//wire [7:0] cpu_Din_raw = cs_palette                              ? palette_D :
-//                         cs_watchdog                             ? 8'hFF :
-//                         cs_in1          ? {1'b1, ~p1_fire_ext[2], ~p1_fire_ext[1], ~p1_fire_ext[0],
-//                                            ~p1_joy[3], ~p1_joy[2], ~p1_joy[1], ~p1_joy[0]} :
-//                         cs_in2          ? {1'b1, ~p2_fire_ext[2], ~p2_fire_ext[1], ~p2_fire_ext[0],
-//                                            ~p2_joy[3], ~p2_joy[2], ~p2_joy[1], ~p2_joy[0]} :
-//                         (cs_dsw2 | cs_in0 | cs_dsw1)            ? controls_dip :
-//                         ~n_cs_workram                           ? workram_D :
-//                         ~n_cs_bankrom                           ? bank_rom_D :
-//                         ~n_cs_mainrom                           ? mainrom_D :
-//                         ~n_cs_videoram                          ? videoram_D :
-//                         8'hFF;
+wire [7:0] cpu_Din_raw = cs_palette                              ? palette_D :
+                         cs_watchdog                             ? 8'hFF :
+                         cs_in1          ? {1'b1, ~p1_fire_ext[2], ~p1_fire_ext[1], ~p1_fire_ext[0],
+                                            ~p1_joy[3], ~p1_joy[2], ~p1_joy[1], ~p1_joy[0]} :
+                         cs_in2          ? {1'b1, ~p2_fire_ext[2], ~p2_fire_ext[1], ~p2_fire_ext[0],
+                                            ~p2_joy[3], ~p2_joy[2], ~p2_joy[1], ~p2_joy[0]} :
+                         (cs_dsw2 | cs_in0 | cs_dsw1)            ? controls_dip :
+                         ~n_cs_workram                           ? workram_D :
+                         ~n_cs_bankrom                           ? bank_rom_D :
+                         ~n_cs_mainrom                           ? mainrom_D :
+                         ~n_cs_videoram                          ? videoram_D :
+                         8'hFF;
 
-wire [7:0] cpu_Din_raw = mainrom_D;
-
-// Apply Konami-1 decryption for opcode fetches from ROM only
-wire rom_region = (~n_cs_mainrom | ~n_cs_bankrom);
-
-//wire [7:0] cpu_Din = (opcode_fetch && rom_region) ? (cpu_Din_raw ^ konami1_xor) : cpu_Din_raw;
-
-// TEMPORARY: bypass Konami-1 decryption for testing
 wire [7:0] cpu_Din = cpu_Din_raw;
 
 //------------------------------------------------------- Main program ROMs ----------------------------------------------------//
