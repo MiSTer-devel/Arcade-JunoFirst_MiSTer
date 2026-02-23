@@ -1,70 +1,62 @@
 //============================================================================
-// 
-//  Time Pilot sound PCB model
-//  Copyright (C) 2021 Ace
 //
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the 
-//  Software is furnished to do so, subject to the following conditions:
+//  Juno First sound board
+//  Based on MAME junofrst.cpp audio implementation
 //
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-//  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
+//  Sound system: Z80 (1.789 MHz) + AY-8910 + i8039 (8 MHz) + 8-bit DAC
 //
 //============================================================================
 
-module TimePilot_SND
+module JunoFirst_SND
 (
 	input                reset,
-	input                clk_49m,         //Actual frequency: 49.152MHz
+	input                clk_49m,
+
+	// Controls/DIP interface (muxed here, read by CPU board)
 	input         [15:0] dip_sw,
-	input          [1:0] coin,                     //0 = coin 1, 1 = coin 2
-	input          [1:0] start_buttons,            //0 = Player 1, 1 = Player 2
-	input          [3:0] p1_joystick, p2_joystick, //0 = up, 1 = down, 2 = left, 3 = right
+	input          [1:0] coin,
+	input          [1:0] start_buttons,
+	input          [3:0] p1_joystick, p2_joystick,
 	input                p1_fire,
 	input                p2_fire,
 	input                btn_service,
 	input                cpubrd_A5, cpubrd_A6,
 	input                cs_controls_dip1, cs_dip2,
-	input                irq_trigger, cs_sounddata,
-	input          [7:0] cpubrd_Din,
-	
 	output         [7:0] controls_dip,
+
+	// Sound command interface from CPU board
+	input                irq_trigger,
+	input                cs_sounddata,
+	input          [7:0] cpubrd_Din,
+
+	// Audio output
 	output signed [15:0] sound,
-	
-	//This input serves to select different fractional dividers to acheive 1.789772MHz for the sound Z80 and AY-3-8910s
-	//depending on whether Time Pilot runs with original or underclocked timings to normalize sync frequencies
+
+	// Underclock selection
 	input                underclock,
-	
-	input                ep7_cs_i,
+
+	// ROM loading
+	input                sndrom_cs_i,   // Z80 sound ROM chip select
+	input                sndrom_wr,     // Z80 sound ROM write enable (ioctl_wr for index 1)
+	input                mcurom_cs_i,   // i8039 MCU ROM chip select
+	input                mcurom_wr,     // i8039 MCU ROM write enable (ioctl_wr for index 2)
 	input         [24:0] ioctl_addr,
-	input          [7:0] ioctl_data,
-	input                ioctl_wr
-	//The sound board contains a video passthrough but video will instead be tapped
-	//straight from the CPU board implementation (this passthrough is redundant for
-	//an FPGA implementation)
+	input          [7:0] ioctl_data
 );
 
-//------------------------------------------------------- Signal outputs -------------------------------------------------------//
+//------------------------------------------------------- Controls mux -------------------------------------------------------//
 
-//Multiplex controls and DIP switches to be output to CPU board
-assign controls_dip = cs_controls_dip1 ? controls_dip1:
-                      cs_dip2          ? dip_sw[15:8]:
+wire [7:0] controls_dip1 = ({cpubrd_A6, cpubrd_A5} == 2'b00) ? {3'b111, start_buttons, btn_service, coin} :
+                           ({cpubrd_A6, cpubrd_A5} == 2'b01) ? {3'b111, p1_fire, p1_joystick[1:0], p1_joystick[3:2]} :
+                           ({cpubrd_A6, cpubrd_A5} == 2'b10) ? {3'b111, p2_fire, p2_joystick[1:0], p2_joystick[3:2]} :
+                           ({cpubrd_A6, cpubrd_A5} == 2'b11) ? dip_sw[7:0] :
+                           8'hFF;
+assign controls_dip = cs_controls_dip1 ? controls_dip1 :
+                      cs_dip2          ? dip_sw[15:8] :
                       8'hFF;
 
-//------------------------------------------------------- Clock division -------------------------------------------------------//
+//------------------------------------------------------- Clock generation ---------------------------------------------------//
 
-//Generate clock enables for sound data and IRQ logic, and DC offset removal
 reg [8:0] div = 9'd0;
 always_ff @(posedge clk_49m) begin
 	div <= div + 9'd1;
@@ -72,440 +64,322 @@ end
 wire cen_3m = !div[3:0];
 wire cen_dcrm = !div;
 
-//Generate 1.789772MHz clock enable for Z80 and AY-3-8910s, clock enable for AY-3-8910 timer
-//(uses Jotego's fractional clock divider from JTFRAME)
+// Z80 + AY-8910: ~1.789772 MHz
 wire [9:0] sound_cen_n = underclock ? 10'd31 : 10'd30;
 wire [9:0] sound_cen_m = underclock ? 10'd843 : 10'd824;
-wire cen_1m79, cen_timer;
+wire cen_1m79;
 jtframe_frac_cen #(10) sound_cen
 (
 	.clk(clk_49m),
 	.n(sound_cen_n),
 	.m(sound_cen_m),
-	.cen({cen_timer, 8'bZZZZZZZZ, cen_1m79})
+	.cen({9'bZZZZZZZZZ, cen_1m79})
 );
 
-//------------------------------------------------------------ CPU -------------------------------------------------------------//
+// i8039: ~8 MHz from 49.152 MHz
+// 49.152 / 6 = 8.192 MHz (close to 8 MHz, standard MiSTer approximation)
+reg [2:0] mcu_div = 3'd0;
+wire cen_8m = (mcu_div == 3'd0);
+always_ff @(posedge clk_49m) begin
+	mcu_div <= (mcu_div == 3'd5) ? 3'd0 : mcu_div + 3'd1;
+end
 
-//Sound CPU - Zilog Z80 (uses T80s version of the T80 soft core)
-wire [15:0] sound_A;
-wire [7:0] sound_Dout;
+//------------------------------------------------------- Sound latch (main CPU -> Z80) --------------------------------------//
+
+reg [7:0] soundlatch = 8'd0;
+always_ff @(posedge clk_49m) begin
+	if(!reset)
+		soundlatch <= 8'd0;
+	else if(cen_3m && cs_sounddata)
+		soundlatch <= cpubrd_Din;
+end
+
+//------------------------------------------------------- Z80 sound CPU ------------------------------------------------------//
+
+wire [15:0] snd_A;
+wire [7:0] snd_Dout;
 wire n_m1, n_mreq, n_iorq, n_rd, n_wr, n_rfsh;
-T80s C8
+
+T80s Z80_snd
 (
 	.RESET_n(reset),
 	.CLK(clk_49m),
 	.CEN(cen_1m79),
-	.INT_n(n_irq),
+	.INT_n(snd_n_irq),
 	.M1_n(n_m1),
 	.MREQ_n(n_mreq),
 	.IORQ_n(n_iorq),
 	.RD_n(n_rd),
 	.WR_n(n_wr),
 	.RFSH_n(n_rfsh),
-	.A(sound_A),
-	.DI(sound_Din),
-	.DO(sound_Dout)
+	.A(snd_A),
+	.DI(snd_Din),
+	.DO(snd_Dout)
 );
-//Address decoding for Z80
-wire cs_soundrom = (~n_mreq & n_rfsh & (sound_A[15:13] == 3'b000));
-wire cs_soundram = (~n_mreq & n_rfsh & (sound_A[15:12] == 4'b0011));
-wire cs_ay1_1 = (~n_mreq & n_rfsh & (sound_A[15:12] == 4'b0100));
-wire cs_ay1_2 = (~n_mreq & n_rfsh & (sound_A[15:12] == 4'b0101));
-wire cs_ay2_1 = (~n_mreq & n_rfsh & (sound_A[15:12] == 4'b0110));
-wire cs_ay2_2 = (~n_mreq & n_rfsh & (sound_A[15:12] == 4'b0111));
-wire cs_lpf = ~(n_wr | ~sound_A[15]);
-//Multiplex data input to Z80
-wire [7:0] sound_Din =
-		cs_soundrom           ? eprom7_D:
-		(cs_soundram & n_wr)  ? sndram_D:
-		(~ay1_bdir & ay1_bc1) ? ay1_D:
-		(~ay2_bdir & ay2_bc1) ? ay2_D:
-		8'hFF;
 
-//Sound ROM
-wire [7:0] eprom7_D;
-eprom_7 A6
+// Z80 address decoding (MAME audio_map):
+//   0x0000-0x0FFF = ROM (4KB)
+//   0x2000-0x23FF = RAM (1KB)
+//   0x3000        = soundlatch read
+//   0x4000        = AY-8910 address write
+//   0x4001        = AY-8910 data read
+//   0x4002        = AY-8910 data write
+//   0x5000        = soundlatch2 write (to i8039)
+//   0x6000        = i8039 IRQ trigger
+wire cs_sndrom    = (~n_mreq & n_rfsh & (snd_A[15:12] == 4'h0));
+wire cs_sndram    = (~n_mreq & n_rfsh & (snd_A[15:10] == 6'b001000));
+wire cs_slatch_r  = (~n_mreq & n_rfsh & (snd_A[15:12] == 4'h3) & n_wr);
+wire cs_ay_addr   = (~n_mreq & n_rfsh & (snd_A == 16'h4000) & ~n_wr);
+wire cs_ay_drd    = (~n_mreq & n_rfsh & (snd_A == 16'h4001) & n_wr);
+wire cs_ay_dwr    = (~n_mreq & n_rfsh & (snd_A == 16'h4002) & ~n_wr);
+wire cs_slatch2_w = (~n_mreq & n_rfsh & (snd_A[15:12] == 4'h5) & ~n_wr);
+wire cs_mcu_irq   = (~n_mreq & n_rfsh & (snd_A[15:12] == 4'h6) & ~n_wr);
+
+// Z80 data input mux
+wire [7:0] snd_Din = cs_sndrom              ? sndrom_D :
+                     (cs_sndram & n_wr)      ? sndram_D :
+                     cs_slatch_r             ? soundlatch :
+                     cs_ay_drd               ? ay_D :
+                     8'hFF;
+
+// Z80 IRQ — edge detect on irq_trigger (MAME sh_irqtrigger_w: fires on 0->1)
+wire irq_clr = (~reset | ~(n_iorq | n_m1));
+reg snd_n_irq = 1;
+reg last_irq_state = 0;
+always_ff @(posedge clk_49m) begin
+	if(!reset) begin
+		snd_n_irq <= 1;
+		last_irq_state <= 0;
+	end
+	else begin
+		if(irq_clr)
+			snd_n_irq <= 1;
+		else if(irq_trigger && !last_irq_state)
+			snd_n_irq <= 0;
+		last_irq_state <= irq_trigger;
+	end
+end
+
+//------------------------------------------------------- Z80 ROM & RAM -----------------------------------------------------//
+
+wire [7:0] sndrom_D;
+eprom_4k snd_rom
 (
-	.ADDR(sound_A[12:0]),
+	.ADDR(snd_A[11:0]),
 	.CLK(clk_49m),
-	.DATA(eprom7_D),
+	.DATA(sndrom_D),
 	.ADDR_DL(ioctl_addr),
 	.CLK_DL(clk_49m),
 	.DATA_IN(ioctl_data),
-	.CS_DL(ep7_cs_i),
-	.WR(ioctl_wr)
+	.CS_DL(sndrom_cs_i),
+	.WR(sndrom_wr)
 );
 
-//Sound RAM (lower 4 bits)
 wire [7:0] sndram_D;
-spram #(4, 10) A2
+spram #(8, 10) snd_ram
 (
 	.clk(clk_49m),
-	.we(cs_soundram & ~n_wr),
-	.addr(sound_A[9:0]),
-	.data(sound_Dout[3:0]),
-	.q(sndram_D[3:0])
+	.we(cs_sndram & ~n_wr),
+	.addr(snd_A[9:0]),
+	.data(snd_Dout),
+	.q(sndram_D)
 );
 
-//Sound RAM (upper 4 bits)
-spram #(4, 10) A3
-(
-	.clk(clk_49m),
-	.we(cs_soundram & ~n_wr),
-	.addr(sound_A[9:0]),
-	.data(sound_Dout[7:4]),
-	.q(sndram_D[7:4])
-);
+//------------------------------------------------------- Soundlatch2 (Z80 -> i8039) ----------------------------------------//
 
-//Generate Z80 interrupts
-wire irq_clr = (~reset | ~(n_iorq | n_m1));
-reg n_irq = 1;
-always_ff @(posedge clk_49m or posedge irq_clr) begin
-	if(irq_clr)
-		n_irq <= 1;
-	else if(cen_3m && irq_trigger)
-		n_irq <= 0;
-end
-
-//--------------------------------------------------- Controls & DIP switches --------------------------------------------------//
-
-//Multiplex player inputs and DIP switch bank 1
-wire [7:0] controls_dip1 = ({cpubrd_A6, cpubrd_A5} == 2'b00) ? {3'b111, start_buttons, btn_service, coin}:
-                           ({cpubrd_A6, cpubrd_A5} == 2'b01) ? {3'b111, p1_fire, p1_joystick[1:0], p1_joystick[3:2]}:
-                           ({cpubrd_A6, cpubrd_A5} == 2'b10) ? {3'b111, p2_fire, p2_joystick[1:0], p2_joystick[3:2]}:
-                           ({cpubrd_A6, cpubrd_A5} == 2'b11) ? dip_sw[7:0]:
-                           8'hFF;
-
-//--------------------------------------------------------- Sound chips --------------------------------------------------------//
-
-//Generate BC1 and BDIR signals for both AY-3-8910s
-wire ay1_bdir = ~(~cs_ay1_2 & (n_wr | ~cs_ay1_1));
-wire ay1_bc1 = ~(~cs_ay1_2 & (n_rd | ~cs_ay1_1));
-wire ay2_bdir = ~(~cs_ay2_2 & (n_wr | ~cs_ay2_1));
-wire ay2_bc1 = ~(~cs_ay2_2 & (n_rd | ~cs_ay2_1));
-
-//AY-3-8910 timer (code adapted from MiSTer-X's Gyruss core, which uses an identical timer)
-reg [3:0] timer_sel;
-wire [3:0] timer_val;
-always_comb begin
-	case(timer_sel)
-		0: timer_val = 4'h0;
-		1: timer_val = 4'h1;
-		2: timer_val = 4'h2;
-		3: timer_val = 4'h3;
-		4: timer_val = 4'h4;
-		5: timer_val = 4'h9;
-		6: timer_val = 4'hA;
-		7: timer_val = 4'hB;
-		8: timer_val = 4'hA;
-		9: timer_val = 4'hD;
-		default: timer_val = 0;
-	endcase
-end
-reg [3:0] timer = 4'd0;
-always_ff @(posedge clk_49m) begin
-	if(cen_timer) begin
-		timer <= timer_val;
-		timer_sel <= (timer_sel == 4'd9) ? 4'd0 : (timer_sel + 4'd1);
-	end
-end
-
-//Latch sound data coming in from CPU board
-reg [7:0] sound_D = 8'd0;
+reg [7:0] soundlatch2 = 8'd0;
 always_ff @(posedge clk_49m) begin
 	if(!reset)
-		sound_D <= 8'd0;
-	else if(cen_3m && cs_sounddata)
-		sound_D <= cpubrd_Din;
+		soundlatch2 <= 8'd0;
+	else if(cs_slatch2_w)
+		soundlatch2 <= snd_Dout;
 end
 
-//Sound chip 1 (AY-3-8910 - uses JT49 by Jotego)
-wire [7:0] ay1_D;
-wire [7:0] ay1A_raw, ay1B_raw, ay1C_raw;
-jt49_bus #(.COMP(3'b100)) F7
-(
-	.rst_n(reset),
-	.clk(clk_49m),
-	.clk_en(cen_1m79),
-	.bdir(ay1_bdir),
-	.bc1(ay1_bc1),
-	.din(sound_Dout),
-	.sel(1),
-	.dout(ay1_D),
-	.A(ay1A_raw),
-	.B(ay1B_raw),
-	.C(ay1C_raw),
-	.IOA_in(sound_D),
-	.IOB_in({timer, 4'b0000})
-);
+//------------------------------------------------------- i8039 IRQ ----------------------------------------------------------//
 
-//Sound chip 2 (AY-3-8910 - uses JT49 by Jotego)
-wire [7:0] ay2_D;
-wire [7:0] ay2A_raw, ay2B_raw, ay2C_raw;
-jt49_bus #(.COMP(3'b100)) F8
-(
-	.rst_n(reset),
-	.clk(clk_49m),
-	.clk_en(cen_1m79),
-	.bdir(ay2_bdir),
-	.bc1(ay2_bc1),
-	.din(sound_Dout),
-	.sel(1),
-	.dout(ay2_D),
-	.A(ay2A_raw),
-	.B(ay2B_raw),
-	.C(ay2C_raw)
-);
-
-//----------------------------------------------------- Final audio output -----------------------------------------------------//
-
-//Apply gain and remove DC offset from AY-3-8910s (uses jt49_dcrm2 from JT49 by Jotego for DC offset removal)
-wire signed [15:0] ay1A_dcrm, ay1B_dcrm, ay1C_dcrm, ay2A_dcrm, ay2B_dcrm, ay2C_dcrm;
-jt49_dcrm2 #(16) dcrm_ay1A
-(
-	.clk(clk_49m),
-	.cen(cen_dcrm),
-	.rst(~reset),
-	.din({3'd0, ay1A_raw, 5'd0}),
-	.dout(ay1A_dcrm)
-);
-jt49_dcrm2 #(16) dcrm_ay1B
-(
-	.clk(clk_49m),
-	.cen(cen_dcrm),
-	.rst(~reset),
-	.din({3'd0, ay1B_raw, 5'd0}),
-	.dout(ay1B_dcrm)
-);
-jt49_dcrm2 #(16) dcrm_ay1C
-(
-	.clk(clk_49m),
-	.cen(cen_dcrm),
-	.rst(~reset),
-	.din({3'd0, ay1C_raw, 5'd0}),
-	.dout(ay1C_dcrm)
-);
-
-jt49_dcrm2 #(16) dcrm_ay2A
-(
-	.clk(clk_49m),
-	.cen(cen_dcrm),
-	.rst(~reset),
-	.din({3'd0, ay2A_raw, 5'd0}),
-	.dout(ay2A_dcrm)
-);
-jt49_dcrm2 #(16) dcrm_ay2B
-(
-	.clk(clk_49m),
-	.cen(cen_dcrm),
-	.rst(~reset),
-	.din({3'd0, ay2B_raw, 5'd0}),
-	.dout(ay2B_dcrm)
-);
-jt49_dcrm2 #(16) dcrm_ay2C
-(
-	.clk(clk_49m),
-	.cen(cen_dcrm),
-	.rst(~reset),
-	.din({3'd0, ay2C_raw, 5'd0}),
-	.dout(ay2C_dcrm)
-);
-
-//Time Pilot's AY-3-8910s contain selectable low-pass filters with the following cutoff frequencies:
-//3386.28Hz, 723.43Hz, 596.09Hz
-//Model this here (the PCB handles this via 3 74HC4066 switching ICs located at A2, A3 and A4)
-wire signed [15:0] ay1A_light, ay1A_med, ay1A_heavy, ay1B_light, ay1B_med, ay1B_heavy, ay1C_light, ay1C_med, ay1C_heavy;
-wire signed [15:0] ay2A_light, ay2A_med, ay2A_heavy, ay2B_light, ay2B_med, ay2B_heavy, ay2C_light, ay2C_med, ay2C_heavy;
-wire signed [15:0] ay1A_sound, ay1B_sound, ay1C_sound, ay2A_sound, ay2B_sound, ay2C_sound;
-tp_lpf_light ay1A_lpf_light
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1A_dcrm),
-	.out(ay1A_light)
-);
-tp_lpf_medium ay1A_lpf_medium
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1A_dcrm),
-	.out(ay1A_med)
-);
-tp_lpf_heavy ay1A_lpf_heavy
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1A_dcrm),
-	.out(ay1A_heavy)
-);
-tp_lpf_light ay1B_lpf_light
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1B_dcrm),
-	.out(ay1B_light)
-);
-tp_lpf_medium ay1B_lpf_medium
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1B_dcrm),
-	.out(ay1B_med)
-);
-tp_lpf_heavy ay1B_lpf_heavy
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1B_dcrm),
-	.out(ay1B_heavy)
-);
-tp_lpf_light ay1C_lpf_light
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1C_dcrm),
-	.out(ay1C_light)
-);
-tp_lpf_medium ay1C_lpf_medium
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1C_dcrm),
-	.out(ay1C_med)
-);
-tp_lpf_heavy ay1C_lpf_heavy
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay1C_dcrm),
-	.out(ay1C_heavy)
-);
-
-tp_lpf_light ay2A_lpf_light
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2A_dcrm),
-	.out(ay2A_light)
-);
-tp_lpf_medium ay2A_lpf_medium
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2A_dcrm),
-	.out(ay2A_med)
-);
-tp_lpf_heavy ay2A_lpf_heavy
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2A_dcrm),
-	.out(ay2A_heavy)
-);
-tp_lpf_light ay2B_lpf_light
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2B_dcrm),
-	.out(ay2B_light)
-);
-tp_lpf_medium ay2B_lpf_medium
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2B_dcrm),
-	.out(ay2B_med)
-);
-tp_lpf_heavy ay2B_lpf_heavy
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2B_dcrm),
-	.out(ay2B_heavy)
-);
-tp_lpf_light ay2C_lpf_light
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2C_dcrm),
-	.out(ay2C_light)
-);
-tp_lpf_medium ay2C_lpf_medium
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2C_dcrm),
-	.out(ay2C_med)
-);
-tp_lpf_heavy ay2C_lpf_heavy
-(
-	.clk(clk_49m),
-	.reset(~reset),
-	.in(ay2C_dcrm),
-	.out(ay2C_heavy)
-);
-
-//Latch low-pass filter control lines
-reg [1:0] ay1_filter_A = 2'd0;
-reg [1:0] ay1_filter_B = 2'd0;
-reg [1:0] ay1_filter_C = 2'd0;
-reg [1:0] ay2_filter_A = 2'd0;
-reg [1:0] ay2_filter_B = 2'd0;
-reg [1:0] ay2_filter_C = 2'd0;
+// Z80 writes to 0x6000 -> asserts i8039 INT
+// i8039 clears its own IRQ via P2 bit 7 (inverted)
+reg mcu_int_n = 1;
 always_ff @(posedge clk_49m) begin
-	if(cen_1m79 && cs_lpf) begin
-		ay1_filter_A <= {sound_A[6], sound_A[7]};
-		ay1_filter_B <= {sound_A[8], sound_A[9]};
-		ay1_filter_C <= {sound_A[10], sound_A[11]};
-		ay2_filter_A <= {sound_A[0], sound_A[1]};
-		ay2_filter_B <= {sound_A[2], sound_A[3]};
-		ay2_filter_C <= {sound_A[4], sound_A[5]};
+	if(!reset)
+		mcu_int_n <= 1;
+	else begin
+		if(cs_mcu_irq)
+			mcu_int_n <= 0;
+		else if(!mcu_p2_out[7])   // i8039 clears IRQ by writing P2 bit 7 low
+			mcu_int_n <= 1;
 	end
 end
 
-always_comb begin
-	case(ay1_filter_A)
-		2'b00: ay1A_sound = ay1A_dcrm;
-		2'b01: ay1A_sound = ay1A_light;
-		2'b10: ay1A_sound = ay1A_med;
-		2'b11: ay1A_sound = ay1A_heavy;
-	endcase
-	case(ay1_filter_B)
-		2'b00: ay1B_sound = ay1B_dcrm;
-		2'b01: ay1B_sound = ay1B_light;
-		2'b10: ay1B_sound = ay1B_med;
-		2'b11: ay1B_sound = ay1B_heavy;
-	endcase
-	case(ay1_filter_C)
-		2'b00: ay1C_sound = ay1C_dcrm;
-		2'b01: ay1C_sound = ay1C_light;
-		2'b10: ay1C_sound = ay1C_med;
-		2'b11: ay1C_sound = ay1C_heavy;
-	endcase
-	case(ay2_filter_A)
-		2'b00: ay2A_sound = ay2A_dcrm;
-		2'b01: ay2A_sound = ay2A_light;
-		2'b10: ay2A_sound = ay2A_med;
-		2'b11: ay2A_sound = ay2A_heavy;
-	endcase
-	case(ay2_filter_B)
-		2'b00: ay2B_sound = ay2B_dcrm;
-		2'b01: ay2B_sound = ay2B_light;
-		2'b10: ay2B_sound = ay2B_med;
-		2'b11: ay2B_sound = ay2B_heavy;
-	endcase
-	case(ay2_filter_C)
-		2'b00: ay2C_sound = ay2C_dcrm;
-		2'b01: ay2C_sound = ay2C_light;
-		2'b10: ay2C_sound = ay2C_med;
-		2'b11: ay2C_sound = ay2C_heavy;
-	endcase
-end
+//------------------------------------------------------- i8039 MCU ---------------------------------------------------------//
 
-//Mix all AY-3-8910s (this game has variable low-pass filtering based on how loud the PCB's volume dial is set and will be modeled
-//externally)
-//Also invert the phase as the original PCB uses an op-amp wired as an inverting amplifier prior to the power amp
-assign sound = 16'hFFFF - (ay1A_sound + ay1B_sound + ay1C_sound + ay2A_sound + ay2B_sound + ay2C_sound);
+wire [7:0] mcu_db_o;
+wire [7:0] mcu_p1_out;
+wire [7:0] mcu_p2_out;
+wire mcu_rd_n;
+
+// t48_core provides direct pmem_addr_o (12-bit) — no ALE latching needed!
+wire [11:0] mcu_prog_addr;
+
+// MCU ROM (4KB) - jfs2_p4.bin
+wire [7:0] mcurom_D;
+eprom_4k mcu_rom
+(
+	.ADDR(mcu_prog_addr),
+	.CLK(clk_49m),
+	.DATA(mcurom_D),
+	.ADDR_DL(ioctl_addr),
+	.CLK_DL(clk_49m),
+	.DATA_IN(ioctl_data),
+	.CS_DL(mcurom_cs_i),
+	.WR(mcurom_wr)
+);
+
+// MCU internal RAM (128 bytes for 8039)
+wire [7:0] mcu_dmem_addr;
+wire mcu_dmem_we;
+wire [7:0] mcu_dmem_din;
+wire [7:0] mcu_dmem_dout;
+
+spram #(8, 7) mcu_ram   // 8-bit wide, 7-bit address = 128 bytes
+(
+	.clk(clk_49m),
+	.we(mcu_dmem_we),
+	.addr(mcu_dmem_addr[6:0]),
+	.data(mcu_dmem_dout),
+	.q(mcu_dmem_din)
+);
+
+// MCU external data bus: MOVX reads return soundlatch2
+wire [7:0] mcu_db_in = soundlatch2;
+
+t48_core #(
+	.xtal_div_3_g(1),
+	.register_mnemonic_g(1),
+	.include_port1_g(1),
+	.include_port2_g(1),
+	.include_bus_g(1),
+	.include_timer_g(1),
+	.sample_t1_state_g(4)
+) i8039_mcu (
+	// Crystal / clock
+	.xtal_i(clk_49m),
+	.xtal_en_i(cen_8m),
+	.reset_i(~reset),              // Active HIGH reset
+	// Test pins
+	.t0_i(1'b1),
+	.t0_o(),
+	.t0_dir_o(),
+	.t1_i(1'b1),
+	// Interrupt
+	.int_n_i(mcu_int_n),
+	// External access = always external ROM for 8039
+	.ea_i(1'b1),
+	// Bus control
+	.rd_n_o(mcu_rd_n),
+	.psen_n_o(),
+	.wr_n_o(),
+	.ale_o(),
+	// External data bus (for MOVX instructions)
+	.db_i(mcu_db_in),
+	.db_o(mcu_db_o),
+	.db_dir_o(),
+	// Port 1: DAC output
+	.p1_i(8'hFF),
+	.p1_o(mcu_p1_out),
+	.p1_low_imp_o(),
+	// Port 2: status + IRQ control
+	.p2_i(8'hFF),
+	.p2_o(mcu_p2_out),
+	.p2l_low_imp_o(),
+	.p2h_low_imp_o(),
+	// PROG pin
+	.prog_n_o(),
+	// System clock domain
+	.clk_i(clk_49m),
+	.en_clk_i(cen_8m),
+	.xtal3_o(),
+	// Internal RAM (128 bytes)
+	.dmem_addr_o(mcu_dmem_addr),
+	.dmem_we_o(mcu_dmem_we),
+	.dmem_data_i(mcu_dmem_din),
+	.dmem_data_o(mcu_dmem_dout),
+	// Program ROM (4KB direct interface)
+	.pmem_addr_o(mcu_prog_addr),
+	.pmem_data_i(mcurom_D)
+);
+
+// i8039 status fed back to Z80 via AY port A (bits 2:0)
+wire [2:0] i8039_status = mcu_p2_out[6:4];
+
+//------------------------------------------------------- AY-8910 -----------------------------------------------------------//
+
+// Port A read: timer[3:0] in bits 7:4, i8039_status in bits 2:0
+// Timer = Z80 cycle count / 512 (MAME: total_cycles / (1024/2))
+reg [12:0] snd_cycle_cnt = 13'd0;
+always_ff @(posedge clk_49m) begin
+	if(!reset)
+		snd_cycle_cnt <= 13'd0;
+	else if(cen_1m79)
+		snd_cycle_cnt <= snd_cycle_cnt + 13'd1;
+end
+wire [3:0] ay_timer = snd_cycle_cnt[12:9];
+wire [7:0] ay_portA_in = {ay_timer, 1'b0, i8039_status};
+
+// BC1/BDIR for AY-8910
+wire ay_bdir = cs_ay_addr | cs_ay_dwr;
+wire ay_bc1  = cs_ay_addr | cs_ay_drd;
+
+wire [7:0] ay_D;
+wire [7:0] ayA_raw, ayB_raw, ayC_raw;
+
+jt49_bus #(.COMP(3'b100)) AY1
+(
+	.rst_n(reset),
+	.clk(clk_49m),
+	.clk_en(cen_1m79),
+	.bdir(ay_bdir),
+	.bc1(ay_bc1),
+	.din(snd_Dout),
+	.sel(1),
+	.dout(ay_D),
+	.A(ayA_raw),
+	.B(ayB_raw),
+	.C(ayC_raw),
+	.IOA_in(ay_portA_in),
+	.IOB_in(8'h00)
+);
+
+// Note: AY port B output controls RC filter switching per channel.
+// MAME portB_w: bits [1:0]=ch.A filter, [3:2]=ch.B, [5:4]=ch.C
+// Each pair selects capacitance: bit0=47nF, bit1=220nF (additive)
+// For initial implementation, no dynamic filter switching — just DC removal.
+// TODO: Add switchable RC filters for accuracy.
+
+//------------------------------------------------------- DAC output --------------------------------------------------------//
+
+// i8039 P1 -> 8-bit R2R DAC (100K/200K ladder)
+// Convert unsigned 8-bit to signed 16-bit
+wire signed [15:0] dac_sound = {~mcu_p1_out[7], mcu_p1_out[6:0], 8'd0};
+
+//------------------------------------------------------- Audio mixing ------------------------------------------------------//
+
+// DC offset removal for AY channels
+wire signed [15:0] ayA_dcrm, ayB_dcrm, ayC_dcrm;
+
+jt49_dcrm2 #(16) dcrm_A (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                          .din({3'd0, ayA_raw, 5'd0}), .dout(ayA_dcrm));
+jt49_dcrm2 #(16) dcrm_B (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                          .din({3'd0, ayB_raw, 5'd0}), .dout(ayB_dcrm));
+jt49_dcrm2 #(16) dcrm_C (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                          .din({3'd0, ayC_raw, 5'd0}), .dout(ayC_dcrm));
+
+// Mix AY (3 channels at 0.30 each from MAME) + DAC (0.25 from MAME)
+wire signed [17:0] mix = ayA_dcrm + ayB_dcrm + ayC_dcrm + dac_sound;
+
+// Saturate to 16-bit signed
+assign sound = (mix > 18'sd32767)  ? 16'sd32767 :
+               (mix < -18'sd32768) ? -16'sd32768 :
+               mix[15:0];
 
 endmodule

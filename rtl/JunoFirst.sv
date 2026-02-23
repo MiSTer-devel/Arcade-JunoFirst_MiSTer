@@ -69,15 +69,18 @@ wire [7:0] controls_dip, cpubrd_D;
 
 //Index-filtered ROM write signals
 wire ioctl_wr_cpu = ioctl_wr && (ioctl_index == 8'd0); // Main CPU board (index 0)
-wire ioctl_wr_snd = ioctl_wr && (ioctl_index == 8'd1); // Sound board (index 1)
+wire ioctl_wr_snd = ioctl_wr && (ioctl_index == 8'd1); // Z80 sound ROM (index 1)
+wire ioctl_wr_mcu = ioctl_wr && (ioctl_index == 8'd2); // i8039 MCU ROM (index 2)
 
 //ROM loader signals for MISTer (loads ROMs from SD card)
 wire prog_rom1_cs_i, prog_rom2_cs_i, prog_rom3_cs_i;
 wire bank0_cs_i, bank1_cs_i, bank2_cs_i, bank3_cs_i, bank4_cs_i, bank5_cs_i;
 wire blit0_cs_i, blit1_cs_i, blit2_cs_i;
 
-//Sound board ROM chip select (index 1, 8KB at 0x0000-0x1FFF)
-wire ep7_cs_i = (ioctl_addr < 25'h2000);
+// Sound Z80 ROM (index 1, 4KB at 0x0000-0x0FFF)
+wire sndrom_cs_i = (ioctl_addr < 25'h1000);
+// i8039 MCU ROM (index 2, 4KB at 0x0000-0x0FFF)
+wire mcurom_cs_i = (ioctl_addr < 25'h1000);
 
 //MiSTer data write selector
 selector DLSEL
@@ -154,12 +157,11 @@ JunoFirst_CPU main_pcb
 );
 
 //Instantiate sound PCB
-TimePilot_SND sound_pcb
+JunoFirst_SND sound_pcb
 (
 	.reset(reset),
 	.clk_49m(clk_49m),
-	.irq_trigger(irq_trigger),
-	.cs_sounddata(cs_sounddata),
+
 	.dip_sw(dip_sw),
 	.coin(coin),
 	.start_buttons(start_buttons),
@@ -168,20 +170,25 @@ TimePilot_SND sound_pcb
 	.p1_fire(~m_fire1_l),
 	.p2_fire(~m_fire2_l),
 	.btn_service(btn_service),
-	
-	.cs_controls_dip1(cs_controls_dip1),
-	.cs_dip2(cs_dip2),
 	.cpubrd_A5(A5),
 	.cpubrd_A6(A6),
-	.cpubrd_Din(cpubrd_D),	
+	.cs_controls_dip1(cs_controls_dip1),
+	.cs_dip2(cs_dip2),
 	.controls_dip(controls_dip),
+
+	.irq_trigger(irq_trigger),
+	.cs_sounddata(cs_sounddata),
+	.cpubrd_Din(cpubrd_D),
+
 	.sound(sound),
-	
+
 	.underclock(underclock),
-	
-	.ep7_cs_i(ep7_cs_i),
+
+	.sndrom_cs_i(sndrom_cs_i),
+	.sndrom_wr(ioctl_wr_snd),
+	.mcurom_cs_i(mcurom_cs_i),
+	.mcurom_wr(ioctl_wr_mcu),
 	.ioctl_addr(ioctl_addr),
-	.ioctl_wr(ioctl_wr_snd),
 	.ioctl_data(ioctl_data)
 );
 
