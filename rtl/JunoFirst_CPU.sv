@@ -198,12 +198,17 @@ mc6809e E3
 // previous E-rising edge, the current bus read is an opcode fetch.
 wire cpu_LIC;  // Connected to .LIC() port of mc6809e above
 
+reg lic_delayed = 0;
 reg opcode_fetch = 0;
 always_ff @(posedge clk_49m) begin
-	if(!reset)
+	if(!reset) begin
+		lic_delayed <= 0;
 		opcode_fetch <= 0;
-	else if(cpu_E && !cpu_Q)  // Rising edge of E (when E transitions happen)
-		opcode_fetch <= cpu_LIC;
+	end
+	else if(cpu_E && !cpu_Q) begin
+		lic_delayed <= cpu_LIC;
+		opcode_fetch <= lic_delayed;
+	end
 end
 
 // XOR mask based on address bits 3 and 1 only (MAME: adr & 0xA)
@@ -408,22 +413,28 @@ end
 
 // I/O registers must be checked first (they're in the 0x8000-0x87FF range)
 // Controls/DIP data comes from the sound board via controls_dip
-wire [7:0] cpu_Din_raw = cs_palette                              ? palette_D :
-                         cs_watchdog                             ? 8'hFF :
-                         cs_in1          ? {1'b1, ~p1_fire_ext[2], ~p1_fire_ext[1], ~p1_fire_ext[0],
-                                            ~p1_joy[3], ~p1_joy[2], ~p1_joy[1], ~p1_joy[0]} :
-                         cs_in2          ? {1'b1, ~p2_fire_ext[2], ~p2_fire_ext[1], ~p2_fire_ext[0],
-                                            ~p2_joy[3], ~p2_joy[2], ~p2_joy[1], ~p2_joy[0]} :
-                         (cs_dsw2 | cs_in0 | cs_dsw1)            ? controls_dip :
-                         ~n_cs_workram                           ? workram_D :
-                         ~n_cs_bankrom                           ? bank_rom_D :
-                         ~n_cs_mainrom                           ? mainrom_D :
-                         ~n_cs_videoram                          ? videoram_D :
-                         8'hFF;
+//wire [7:0] cpu_Din_raw = cs_palette                              ? palette_D :
+//                         cs_watchdog                             ? 8'hFF :
+//                         cs_in1          ? {1'b1, ~p1_fire_ext[2], ~p1_fire_ext[1], ~p1_fire_ext[0],
+//                                            ~p1_joy[3], ~p1_joy[2], ~p1_joy[1], ~p1_joy[0]} :
+//                         cs_in2          ? {1'b1, ~p2_fire_ext[2], ~p2_fire_ext[1], ~p2_fire_ext[0],
+//                                            ~p2_joy[3], ~p2_joy[2], ~p2_joy[1], ~p2_joy[0]} :
+//                         (cs_dsw2 | cs_in0 | cs_dsw1)            ? controls_dip :
+//                         ~n_cs_workram                           ? workram_D :
+//                         ~n_cs_bankrom                           ? bank_rom_D :
+//                         ~n_cs_mainrom                           ? mainrom_D :
+//                         ~n_cs_videoram                          ? videoram_D :
+//                         8'hFF;
+
+wire [7:0] cpu_Din_raw = mainrom_D;
 
 // Apply Konami-1 decryption for opcode fetches from ROM only
 wire rom_region = (~n_cs_mainrom | ~n_cs_bankrom);
-wire [7:0] cpu_Din = (opcode_fetch && rom_region) ? (cpu_Din_raw ^ konami1_xor) : cpu_Din_raw;
+
+//wire [7:0] cpu_Din = (opcode_fetch && rom_region) ? (cpu_Din_raw ^ konami1_xor) : cpu_Din_raw;
+
+// TEMPORARY: bypass Konami-1 decryption for testing
+wire [7:0] cpu_Din = cpu_Din_raw;
 
 //------------------------------------------------------- Main program ROMs ----------------------------------------------------//
 
