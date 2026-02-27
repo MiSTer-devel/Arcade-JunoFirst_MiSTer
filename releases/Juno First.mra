@@ -25,7 +25,7 @@
 	<joystick>4-way</joystick>
 	<special_controls></special_controls>
 	<num_buttons>2</num_buttons>
-	<button_names>Fire,Warp</button_names>
+	<buttons default="B,A,Select,Start,R,L" names="Fire,Warp,Start 1P,Start 2P,Coin,Pause"></buttons>
 
 	<!-- DIP switches from MAME junofrst.cpp
 	     DSW1 (bits 0-7)  = Coinage (KONAMI_COINAGE_LOC)
