@@ -25,7 +25,7 @@
 	<joystick>4-way</joystick>
 	<special_controls></special_controls>
 	<num_buttons>2</num_buttons>
-	<button_names>Fire,Warp</button_names>
+	<buttons names="Fire,Warp,Start1P,Start2P,Coin,Pause"/>
 
 	<switches default="FF,73">
 		<!-- DSW1: Coinage (bits 0-7) -->
@@ -75,7 +75,7 @@
     <!-- Juno First Stores in Work Ram : 8100->819F -->
 	<rom index="3" md5="none">
 		<part>
-		00 00 FF FF 00 FF 00 02 00 02 00 01 00 FF 00 00
+		01 FF FF FF 00 FF 00 02 00 02 00 01 00 FF 00 00
 		00 00 81 00 00 A0 01 3F
 		</part>
 	</rom>
