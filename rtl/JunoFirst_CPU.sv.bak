@@ -55,7 +55,6 @@ module JunoFirst_CPU
 	input         ioctl_wr,
 
 	input         pause,
-	input         flip_vertical,
 
 	input  [15:0] hs_address,
 	input   [7:0] hs_data_in,
@@ -509,14 +508,11 @@ always_ff @(posedge clk_49m) begin
 end
 wire [7:0] palette_D = palette_regs[cpu_A[3:0]];  // CPU read-back path
 
-wire flip_y_final = flip_y ^ flip_vertical;
-wire flip_x_final = flip_x ^ flip_vertical;
-
 //Video RAM (0x0000-0x7FFF, 32KB) - dual port: A=CPU/blitter, B=video scanout
 wire [7:0] videoram_vout;
 // Apply flip to VRAM read coordinates (Juno First has no hardware scroll register)
-wire [7:0] eff_x = pix_x ^ {8{flip_x_final}};
-wire [7:0] eff_y = v_cnt[7:0] ^ {8{flip_y_final}};
+wire [7:0] eff_x = pix_x ^ {8{flip_x}};
+wire [7:0] eff_y = v_cnt[7:0] ^ {8{flip_y}};
 wire [14:0] vram_rd_addr = {eff_y, eff_x[7:1]};
 
 // VRAM port A is shared between CPU and blitter

@@ -52,7 +52,6 @@ module JunoFirst
 	input          [7:0] ioctl_index,
 	
 	input                pause,
-	input 					flip_vertical,
 	
 	//This input serves to select different fractional dividers to acheive 1.789772MHz for the sound Z80 and AY-3-8910s
 	//depending on whether Time Pilot runs with original or underclocked timings to normalize sync frequencies
@@ -146,7 +145,6 @@ JunoFirst_CPU main_pcb
 	.ioctl_data(ioctl_data),
 
 	.pause(pause),
-	.flip_vertical(flip_vertical),
 
 	.hs_address(hs_address),
 	.hs_data_out(hs_data_out),
