@@ -223,7 +223,7 @@ localparam CONF_STR = {
 	"JUNOFIRST;;",
 	"ODE,Aspect Ratio,Original,Full screen,[ARC1],[ARC2];",
 	"OC,Orientation,Vert,Horz;",
-    "OB,Flip Vertical,Off,On;",
+	"OM,Flip,Off,On;",
 	"OFH,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"OL,Game Speed,Native,60Hz Adjust;",
 	"-;",
@@ -479,7 +479,8 @@ wire ce_pix;
 
 wire rotate_ccw = 0;
 wire no_rotate = status[12] | direct_video;
-wire flip = status[11] | ~no_rotate;
+wire flip = ~no_rotate;
+wire core_flip_vertical = status[22];
 screen_rotate screen_rotate(.*);
 
 arcade_video #(256,24) arcade_video
@@ -543,6 +544,7 @@ JunoFirst JF_inst
 	
 	//Flag to signal that Juno First has been underclocked to normalize video timings in order to maintain consistent sound timings and pitch
 	.underclock(status[21]),
+	.flip_vertical(core_flip_vertical),
 
 	.hs_address(hs_address),
 	.hs_data_out(hs_data_out),
