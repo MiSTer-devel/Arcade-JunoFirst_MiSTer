@@ -28,6 +28,7 @@ module JunoFirst
 (
 	input                reset,
 	input                clk_49m,                  //Actual frequency: 49.152MHz
+	input                clk_8m,                   //i8039 MCU: 8.000MHz exact from PLL
 	input          [1:0] coin,                     //0 = coin 1, 1 = coin 2
 	input          [1:0] start_buttons,            //0 = Player 1, 1 = Player 2
 	input          [3:0] p1_joystick, p2_joystick, //0 = up, 1 = down, 2 = left, 3 = right
@@ -42,6 +43,7 @@ module JunoFirst
 	output               ce_pix,
 	output         [4:0] video_r, video_g, video_b,
 	output signed [15:0] sound,
+	output         [7:0] debug_p1,
 	
 	//Screen centering (alters HSync, VSync and VBlank timing in the Konami 082 to reposition the video output)
 	input          [3:0] h_center, v_center,
@@ -52,10 +54,13 @@ module JunoFirst
 	input          [7:0] ioctl_index,
 	
 	input                pause,
-	
-	//This input serves to select different fractional dividers to acheive 1.789772MHz for the sound Z80 and AY-3-8910s
-	//depending on whether Time Pilot runs with original or underclocked timings to normalize sync frequencies
+
+	// FIX-2026-05-24: video PLL underclock signal passed through to SND
+	// for cen_1m79 frac_cen compensation. See JunoFirst_SND.sv for detail.
 	input                underclock,
+
+	// CRT Flip override (status[22]). XOR'd into eff_y in JunoFirst_CPU.
+	input                flip_vertical,
 
 	input         [15:0] hs_address,
 	input          [7:0] hs_data_in,
@@ -145,6 +150,7 @@ JunoFirst_CPU main_pcb
 	.ioctl_data(ioctl_data),
 
 	.pause(pause),
+	.flip_vertical(flip_vertical),
 
 	.hs_address(hs_address),
 	.hs_data_out(hs_data_out),
@@ -157,6 +163,7 @@ JunoFirst_SND sound_pcb
 (
 	.reset(reset),
 	.clk_49m(clk_49m),
+	.clk_8m(clk_8m),
 
 	.dip_sw(dip_sw),
 	.coin(coin),
@@ -179,7 +186,11 @@ JunoFirst_SND sound_pcb
 	.cpubrd_Din(cpubrd_D),
 
 	.sound(sound),
+	.debug_p1(debug_p1),
 
+	.pause(pause),
+
+	// FIX-2026-05-24: underclock compensation for sound dividers
 	.underclock(underclock),
 
 	.sndrom_cs_i(sndrom_cs_i),

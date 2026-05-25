@@ -200,6 +200,7 @@ assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
+wire [7:0] debug_p1;
 wire signed [15:0] audio;
 assign AUDIO_L = audio;
 assign AUDIO_R = audio;
@@ -208,7 +209,15 @@ assign AUDIO_MIX = 0;
 
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
-assign LED_USER  = ioctl_download;
+// CLK_8M blink test (DIAG-REVERT-2026-05-24, verified 2026-05-24) passed —
+// PLL is exactly 8 MHz. Restoring P1 activity indicator: lights during
+// ROM load, then toggles rapidly whenever the 8039 writes DAC samples.
+// LED steady-off after boot = 8039 not running. LED flickering = 8039 alive.
+//reg [22:0] clk8m_blink_cnt = 0;
+//always @(posedge CLK_8M) clk8m_blink_cnt <= clk8m_blink_cnt + 1'b1;
+//assign LED_USER = clk8m_blink_cnt[22];
+//assign LED_USER  = ioctl_download;
+assign LED_USER  = ioctl_download | debug_p1[0];
 assign BUTTONS = 0;
 
 ///////////////////////////////////////////////////
@@ -223,7 +232,8 @@ localparam CONF_STR = {
 	"JUNOFIRST;;",
 	"ODE,Aspect Ratio,Original,Full screen,[ARC1],[ARC2];",
 	"OC,Orientation,Vert,Horz;",
-    "OB,Flip Vertical,Off,On;",
+    "OB,HDMI Flip,Off,On;",
+    "OM,CRT Flip,Off,On;",
 	"OFH,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"OL,Game Speed,Native,60Hz Adjust;",
 	"-;",
@@ -297,6 +307,18 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 wire CLK_49M;
 wire locked;
+
+wire CLK_8M;
+wire snd_pll_locked;
+
+pll_sound pll_snd
+(
+	.refclk(CLK_50M),
+	.rst(0),
+	.outclk_0(CLK_8M),
+	.locked(snd_pll_locked)
+);
+
 
 pll pll
 (
@@ -503,7 +525,8 @@ JunoFirst JF_inst
 	.reset(~reset),                                        // input reset
 
 	.clk_49m(CLK_49M),                                     // input clk_49m
-	
+	.clk_8m(CLK_8M),                                       // input clk_8m
+
 	.coin({~m_coin2, ~m_coin1}),                           // input [1:0] coin
 	
 	.start_buttons({~m_start2, ~m_start1}),                // input [1:0] start_buttons
@@ -533,16 +556,24 @@ JunoFirst JF_inst
 	.video_b(b_out),                                       // output [4:0] video_b
 	
 	.sound(audio),                                         // output [15:0] sound
-	
+	.debug_p1(debug_p1),
+
 	.ioctl_addr(ioctl_addr),
 	.ioctl_wr(ioctl_wr),
 	.ioctl_data(ioctl_dout),
 	.ioctl_index(ioctl_index),
 	
 	.pause(pause_cpu),
-	
-	//Flag to signal that Juno First has been underclocked to normalize video timings in order to maintain consistent sound timings and pitch
+
+	// FIX-2026-05-24: pass underclock state into core for sound divider
+	// compensation. status[21] is the OSD underclock toggle that drives the
+	// video PLL reconfig.
 	.underclock(status[21]),
+
+	// CRT Flip: coordinate-level vertical flip (XOR into eff_y inside the
+	// CPU module). For CRT users where the framework-level HDMI Flip
+	// (status[11] -> screen_rotate) doesn't reach their output path.
+	.flip_vertical(status[22]),
 
 	.hs_address(hs_address),
 	.hs_data_out(hs_data_out),

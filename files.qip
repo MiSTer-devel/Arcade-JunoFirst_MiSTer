@@ -11,3 +11,6 @@ set_global_assignment -name QIP_FILE rtl/cpu/jf_cpu.qip
 set_global_assignment -name QIP_FILE rtl/custom/jf_custom.qip
 set_global_assignment -name QIP_FILE rtl/sound/jf_sound.qip
 set_global_assignment -name QIP_FILE rtl/ram_rom/jf_ram_rom.qip
+
+set_global_assignment -name VERILOG_FILE rtl/pll_sound.v
+set_global_assignment -name VERILOG_FILE rtl/pll/pll_sound_0002.v

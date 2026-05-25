@@ -56,6 +56,11 @@ module JunoFirst_CPU
 
 	input         pause,
 
+	// CRT Flip (status[22]): coordinate-level vertical flip. XOR'd into
+	// flip_y just before the eff_y read. Independent of HDMI Flip
+	// (status[11] -> screen_rotate framework path).
+	input         flip_vertical,
+
 	input  [15:0] hs_address,
 	input   [7:0] hs_data_in,
 	output  [7:0] hs_data_out,
@@ -138,25 +143,26 @@ assign irq_trigger = sound_irq;
 //------------------------------------------------------- Clock division -------------------------------------------------------//
 
 //Generate 6.144MHz and 3.072MHz clock enables
-reg [3:0] div = 4'd0;
+reg [4:0] div = 5'd0;
 always_ff @(posedge clk_49m) begin
-	div <= div + 4'd1;
+	div <= div + 5'd1;
 end
 wire cen_6m = !div[2:0];
-wire cen_3m = !div;
+wire cen_3m = !div[3:0];
 
-//MC6809E E and Q clock generation from existing div[3:0] counter
-//div rolls over every 16 clocks: E toggles at 49.152MHz/16 = 3.072MHz, E freq = 1.536MHz
-//Q leads E by 90 degrees (4 system clocks)
+//MC6809E E and Q clock generation
+//Real hardware: 18.432MHz crystal / 12 = 1.536MHz E clock
+//FPGA: 49.152MHz / 32 = 1.536MHz (49.152 = 18.432 * 8/3)
+//E/Q transitions every 8 master clocks within 32-clock cycle
 reg cpu_E = 0;
 reg cpu_Q = 0;
 always_ff @(posedge clk_49m) begin
 	if(~pause) begin
-		case(div[3:0])
-			4'd0:  begin cpu_E <= 1; cpu_Q <= 0; end
-			4'd4:  begin cpu_E <= 1; cpu_Q <= 1; end
-			4'd8:  begin cpu_E <= 0; cpu_Q <= 1; end
-			4'd12: begin cpu_E <= 0; cpu_Q <= 0; end
+		case(div[4:0])
+			5'd0:  begin cpu_E <= 1; cpu_Q <= 0; end
+			5'd8:  begin cpu_E <= 1; cpu_Q <= 1; end
+			5'd16: begin cpu_E <= 0; cpu_Q <= 1; end
+			5'd24: begin cpu_E <= 0; cpu_Q <= 0; end
 			default: ;
 		endcase
 	end
@@ -511,8 +517,11 @@ wire [7:0] palette_D = palette_regs[cpu_A[3:0]];  // CPU read-back path
 //Video RAM (0x0000-0x7FFF, 32KB) - dual port: A=CPU/blitter, B=video scanout
 wire [7:0] videoram_vout;
 // Apply flip to VRAM read coordinates (Juno First has no hardware scroll register)
-wire [7:0] eff_x = pix_x ^ {8{flip_x}};
-wire [7:0] eff_y = v_cnt[7:0] ^ {8{flip_y}};
+// CRT Flip (flip_vertical, status[22]) XORs into both flip_x and flip_y (180°
+// rotation) to match what the upstream CRT-user PR shipped. Independent of the
+// framework HDMI Flip path on status[11].
+wire [7:0] eff_x = pix_x      ^ {8{flip_x ^ flip_vertical}};
+wire [7:0] eff_y = v_cnt[7:0] ^ {8{flip_y ^ flip_vertical}};
 wire [14:0] vram_rd_addr = {eff_y, eff_x[7:1]};
 
 // VRAM port A is shared between CPU and blitter

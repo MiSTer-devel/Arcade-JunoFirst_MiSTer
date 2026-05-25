@@ -72,7 +72,8 @@ always @(posedge clk)
             2'b11: begin
                 { wr_n, cs_n } <= 2'b11;
                 addr    <= din[3:0];
-                addr_ok <= din[7:4] == 4'd0;
+//                addr_ok <= din[7:4] == 4'd0;
+                addr_ok <= 1'b1;
             end
         endcase // {bdir,bc1}
     end

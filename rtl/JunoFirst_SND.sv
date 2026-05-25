@@ -11,6 +11,7 @@ module JunoFirst_SND
 (
 	input                reset,
 	input                clk_49m,
+	input                clk_8m,
 
 	// Controls/DIP interface (muxed here, read by CPU board)
 	input         [15:0] dip_sw,
@@ -33,8 +34,14 @@ module JunoFirst_SND
 
 	// Audio output
 	output signed [15:0] sound,
+    output         [7:0] debug_p1,
 
-	// Underclock selection
+	// Pause
+	input                pause,
+
+	// FIX-2026-05-24: video PLL underclock signal — needed to compensate
+	// the cen_1m79 frac_cen so Z80/AY pitch stays correct when status[21]
+	// underclocks CLK_49M ~1% for 60Hz vsync alignment.
 	input                underclock,
 
 	// ROM loading
@@ -71,8 +78,15 @@ end
 wire cen_3m = !div[3:0];
 wire cen_dcrm = !div;
 
-// Z80 + AY-8910: ~1.789772 MHz
-wire [9:0] sound_cen_n = underclock ? 10'd31 : 10'd30;
+// Z80 + AY-8910: 1.789773 MHz target (real hardware: 14.318181 MHz / 8)
+// FIX-2026-05-24: video PLL underclock (~1% slow CLK_49M when status[21]=1
+// for 60Hz vsync alignment) would otherwise drag the AY ~17 cents flat.
+// Conditional n/m compensates so target ~1.789773 MHz is maintained either
+// way. Numbers per March-2026 chat history.
+//   underclock=0: 49.152  * 30/824 = 1.78951 MHz (0.014% low)
+//   underclock=1: ~48.665 * 31/843 = 1.78969 MHz (0.005% low)
+// Comment claimed 67/1838 elsewhere but that exceeds 10-bit m and was wrong.
+wire [9:0] sound_cen_n = underclock ? 10'd31  : 10'd30;
 wire [9:0] sound_cen_m = underclock ? 10'd843 : 10'd824;
 wire cen_1m79;
 jtframe_frac_cen #(10) sound_cen
@@ -81,27 +95,6 @@ jtframe_frac_cen #(10) sound_cen
 	.n(sound_cen_n),
 	.m(sound_cen_m),
 	.cen({9'bZZZZZZZZZ, cen_1m79})
-);
-
-// i8039: ~8 MHz from 49.152 MHz
-// 49.152 / 6 = 8.192 MHz (close to 8 MHz, standard MiSTer approximation)
-//reg [2:0] mcu_div = 3'd0;
-//wire cen_8m = (mcu_div == 3'd0);
-//always_ff @(posedge clk_49m) begin
-//	mcu_div <= (mcu_div == 3'd5) ? 3'd0 : mcu_div + 3'd1;
-//end
-
-// i8039: 8.000 MHz from 49.152 MHz
-// Real hardware uses a separate 8 MHz crystal (not derived from 18.432 MHz main xtal)
-// 49.152 * 125 / 768 = 8.000000 MHz EXACT
-// Previous div-by-6 gave 8.192 MHz (+2.4% error — audibly wrong DAC pitch)
-wire cen_8m;
-jtframe_frac_cen #(10) mcu_cen
-(
-	.clk(clk_49m),
-	.n(10'd125),
-	.m(10'd768),
-	.cen({9'bZZZZZZZZZ, cen_8m})
 );
 
 //------------------------------------------------------- Sound latch (main CPU -> Z80) --------------------------------------//
@@ -124,7 +117,7 @@ T80s Z80_snd
 (
 	.RESET_n(reset),
 	.CLK(clk_49m),
-	.CEN(cen_1m79),
+	.CEN(cen_1m79 & ~pause),
 	.INT_n(snd_n_irq),
 	.M1_n(n_m1),
 	.MREQ_n(n_mreq),
@@ -211,24 +204,30 @@ reg [7:0] soundlatch2 = 8'd0;
 always_ff @(posedge clk_49m) begin
 	if(!reset)
 		soundlatch2 <= 8'd0;
-	else if(cs_slatch2_w)
+	else if (cen_1m79 && cs_slatch2_w)
 		soundlatch2 <= snd_Dout;
 end
 
 //------------------------------------------------------- i8039 IRQ ----------------------------------------------------------//
 
-// Z80 writes to 0x6000 -> asserts i8039 INT
-// i8039 clears its own IRQ via P2 bit 7 (inverted)
-reg mcu_int_n = 1;
-always_ff @(posedge clk_49m) begin
-	if(!reset)
-		mcu_int_n <= 1;
-	else begin
-		if(cs_mcu_irq)
-			mcu_int_n <= 0;
-		else if(!mcu_p2_out[7])   // i8039 clears IRQ by writing P2 bit 7 low
-			mcu_int_n <= 1;
-	end
+// Sync Z80 write to 0x6000 into MCU domain as a *level* (held until MCU clears it)
+reg [2:0] mcu_irq_sync = 3'b111;   // start inactive
+always_ff @(posedge clk_8m) begin
+    mcu_irq_sync <= {mcu_irq_sync[1:0], cs_mcu_irq};
+end
+wire synced_mcu_irq = mcu_irq_sync[2];   // clean level in MCU domain
+
+// IRQ latch — exactly as real hardware / MAME does it
+// Z80 write → assert INT (active low)
+// MCU writes P2.7 low → clear latch
+reg mcu_irq_latch_n = 1'b1;
+always_ff @(posedge clk_8m) begin
+    if (!reset)                    // reset polarity matches the rest of the module
+        mcu_irq_latch_n <= 1'b1;
+    else if (synced_mcu_irq)       // ←←← LEVEL, not edge
+        mcu_irq_latch_n <= 1'b0;
+    else if (!mcu_p2_out[7])       // MCU cleared it
+        mcu_irq_latch_n <= 1'b1;
 end
 
 //------------------------------------------------------- i8039 MCU ---------------------------------------------------------//
@@ -246,7 +245,7 @@ wire [7:0] mcurom_D;
 eprom_4k mcu_rom
 (
 	.ADDR(mcu_prog_addr),
-	.CLK(clk_49m),
+	.CLK(clk_8m),
 	.DATA(mcurom_D),
 	.ADDR_DL(ioctl_addr),
 	.CLK_DL(clk_49m),
@@ -263,7 +262,7 @@ wire [7:0] mcu_dmem_dout;
 
 spram #(8, 7) mcu_ram   // 8-bit wide, 7-bit address = 128 bytes
 (
-	.clk(clk_49m),
+	.clk(clk_8m),
 	.we(mcu_dmem_we),
 	.addr(mcu_dmem_addr[6:0]),
 	.data(mcu_dmem_dout),
@@ -271,7 +270,22 @@ spram #(8, 7) mcu_ram   // 8-bit wide, 7-bit address = 128 bytes
 );
 
 // MCU external data bus: MOVX reads return soundlatch2
-wire [7:0] mcu_db_in = soundlatch2;
+// Sync into clk_8m domain (soundlatch2 written on clk_49m)
+reg [7:0] soundlatch2_sync1, soundlatch2_sync2;
+always_ff @(posedge clk_8m) begin
+    soundlatch2_sync1 <= soundlatch2;
+    soundlatch2_sync2 <= soundlatch2_sync1;
+end
+wire [7:0] mcu_db_in = soundlatch2_sync2;
+
+// Register xtal3_o to break combinational loop — feeds back to en_clk_i
+// This gives the state machine exactly 1 advance per 3 crystal clocks
+// Result: 8 MHz / 3 / 5 = 533.33 kHz machine cycle (exact match to real i8039)
+wire xtal3_raw;
+reg xtal3_reg = 0;
+always_ff @(posedge clk_8m) begin
+	xtal3_reg <= xtal3_raw;
+end
 
 t48_core #(
 	.xtal_div_3_g(1),
@@ -283,16 +297,26 @@ t48_core #(
 	.sample_t1_state_g(4)
 ) i8039_mcu (
 	// Crystal / clock
-	.xtal_i(clk_49m),
-	.xtal_en_i(cen_8m),
-	.reset_i(~reset),              // Active HIGH reset
+	.xtal_i(clk_8m),
+	.xtal_en_i(~pause),
+	// DIAG-REVERT-2026-05-24: original below, uncomment to restore.
+	// Comment claimed reset_i is active-HIGH; it is in fact active-LOW
+	// (res_active_c='0' in t48_pack-p.vhd). The local `reset` signal in this
+	// module is ALSO active-low — top-level Arcade-JunoFirst.sv:517 inverts
+	// the active-high MiSTer reset into JunoFirst, which passes through to
+	// JunoFirst_SND unchanged; confirmed by all `if(!reset)` always_ffs and
+	// AY's .rst_n(reset) wiring. So .reset_i(~reset) was active-HIGH going
+	// into an active-LOW port, holding the 8039 in reset during normal
+	// operation. Same bug class as SegaG80 FIX-2026-05-20.
+	// .reset_i(~reset),              // Active HIGH reset
+	.reset_i(reset),                  // DIAG: pass active-low through to active-low reset_i
 	// Test pins
 	.t0_i(1'b1),
 	.t0_o(),
 	.t0_dir_o(),
 	.t1_i(1'b1),
 	// Interrupt
-	.int_n_i(mcu_int_n),
+	.int_n_i(mcu_irq_latch_n),
 	// External access = always external ROM for 8039
 	.ea_i(1'b1),
 	// Bus control
@@ -316,9 +340,16 @@ t48_core #(
 	// PROG pin
 	.prog_n_o(),
 	// System clock domain
-	.clk_i(clk_49m),
-	.en_clk_i(cen_8m),
-	.xtal3_o(),
+	.clk_i(clk_8m),
+	// DIAG-REVERT-2026-05-24: original below, uncomment to restore.
+	// Audit of t48 clock_ctrl.vhd shows no comb loop exists and en_clk_i must
+	// be a 1-cycle pulse per xtal3 event — i.e. xtal3_o looped *directly*.
+	// The ~xtal3_reg pattern asserts en_clk_i 2 of every 3 clk_8m cycles,
+	// scrambling the MSTATE FSM vs the ALE/RD/WR generator → 8039 executes
+	// garbage → P1 never moves → DAC silent (the observed JF symptom).
+	// .en_clk_i(~xtal3_reg),
+	.en_clk_i(xtal3_raw),   // DIAG: direct xtal3_o loopback (matches SegaG80 FIX-2026-05-20)
+	.xtal3_o(xtal3_raw),
 	// Internal RAM (128 bytes)
 	.dmem_addr_o(mcu_dmem_addr),
 	.dmem_we_o(mcu_dmem_we),
@@ -361,7 +392,7 @@ jt49_bus #(.COMP(3'b100)) AY1
 	.bdir(ay_bdir),
 	.bc1(ay_bc1),
 	.din(snd_Dout),
-	.sel(1),
+	.sel(0),
 	.dout(ay_D),
 	.A(ayA_raw),
 	.B(ayB_raw),
@@ -394,12 +425,64 @@ jt49_dcrm2 #(16) dcrm_B (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
 jt49_dcrm2 #(16) dcrm_C (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
                           .din({3'd0, ayC_raw, 5'd0}), .dout(ayC_dcrm));
 
+// FIX-2026-05-24: DAC needs DC removal too — real hardware AC-couples the
+// audio analog-side, but our digital mix sums raw. Without this, a stuck
+// P1=0xFF (8039 not running) injects +32512 DC into the mix and eats most
+// of the dynamic range → AYs clip on positive peaks. Even when the 8039
+// runs correctly, typical 8-bit unsigned samples bias around mid-scale and
+// would still benefit from being centered.
+wire signed [15:0] dac_dcrm;
+jt49_dcrm2 #(16) dcrm_DAC (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                            .din(dac_sound), .dout(dac_dcrm));
+
 // Mix AY (3 channels at 0.30 each from MAME) + DAC (0.25 from MAME)
-wire signed [17:0] mix = ayA_dcrm + ayB_dcrm + ayC_dcrm + dac_sound;
+// DIAG-REVERT-2026-05-24: restored full AY+DAC mix so AYs are audible while
+// the DAC path is still being debugged. Originally muted to test DAC in
+// isolation (see April-16 chat: "limiting of output to dac only was to test
+// the dac which was outputting ABSOLUTELY NOTHING"). To re-isolate DAC-only,
+// re-enable the `<<< 3` line and comment out the active mix.
+wire signed [17:0] mix = ayA_dcrm + ayB_dcrm + ayC_dcrm
+                       + {dac_dcrm[15], dac_dcrm[15], dac_dcrm};
+// DIAG: DAC-only test lines, kept for easy isolation:
+//wire signed [17:0] mix = (ayA_dcrm + ayB_dcrm + ayC_dcrm) <<< 3;
+//wire signed [17:0] mix = {dac_sound[15], dac_sound[15], dac_sound} <<< 3;
 
 // Saturate to 16-bit signed
-assign sound = (mix > 18'sd32767)  ? 16'sd32767 :
-               (mix < -18'sd32768) ? -16'sd32768 :
-               mix[15:0];
+wire signed [15:0] sound_raw = (mix > 18'sd32767)  ? 16'sd32767 :
+                               (mix < -18'sd32768) ? -16'sd32768 :
+                               mix[15:0];
+assign sound = pause ? 16'sd0 : sound_raw;
+
+//assign debug_p1 = mcu_prog_addr[7:0];
+//assign debug_p1 = {mcu_p2_out[7], mcu_irq_latch_n, mcu_p1_out[5:0]};
+
+// DIAG-REVERT-2026-05-24: PC-change "8039 alive" detector — replaces the
+// P1[0] indicator on LED_USER. The previous indicator was ambiguous (LED
+// solid could mean stuck-in-reset OR alive-but-P1-not-changing). This one
+// samples mcu_prog_addr every ~1 second; if PC moved since last sample,
+// the 8039 ran during that window. Result is ANDed with a slow blink so
+// alive = visible ~0.5 Hz blink, dead = LED off.
+//
+// LED behavior interpretation:
+//   * Visible ~0.5 Hz blink → 8039 is executing instructions (alive)
+//   * Solid OFF             → 8039 is stuck / in reset / not clocked
+//   * Solid ON              → bug in this diagnostic (shouldn't happen)
+//
+// Restore the previous indicator by uncommenting the line above and
+// removing this block.
+reg [11:0] pc_prev_sample = 12'h0;
+reg        pc_alive = 1'b0;
+reg [22:0] pc_check_div = 23'h0;
+reg [23:0] visible_blink_div = 24'h0;
+always @(posedge clk_8m) begin
+    pc_check_div      <= pc_check_div + 23'h1;
+    visible_blink_div <= visible_blink_div + 24'h1;
+    if (pc_check_div == 23'h0) begin
+        pc_alive       <= (mcu_prog_addr != pc_prev_sample);
+        pc_prev_sample <= mcu_prog_addr;
+    end
+end
+wire mcu_alive_led = pc_alive & visible_blink_div[23];
+assign debug_p1 = {mcu_p2_out[7], mcu_irq_latch_n, mcu_p1_out[5:1], mcu_alive_led};
 
 endmodule
