@@ -248,12 +248,10 @@ wire [11:0] mcu_prog_addr = {mcu_p2_out[3:0], mcu_pcad_latch};
 // MCU ROM (4KB) - jfs2_p4.bin
 wire [7:0] mcurom_D;
 
-// DIAG-REVERT-2026-05-25: ROM-integrity walker. After a settle delay,
-// sweeps all 4096 addresses on clk_8m, XORing each byte. Expected XOR
-// signature for jfs2_p4.bin = 8'h37. LED reports match post-walk. During
-// the walk the 8039 is held in reset (see reset_n_i wiring on the
-// t8039_notri instance below). The 10-second reset hold is what made
-// the DAC work — its precise role is still being investigated.
+// DIAG-REVERT-2026-05-25: ROM-integrity walker (10s settle + XOR sweep).
+// Holds 8039 in reset for ~10s after main reset deasserts; required for
+// cold-boot to work reliably even with ioctl_download+PLL-lock in the reset
+// chain. The precise mechanism is still unknown — see lessons-learned note.
 reg [25:0] walker_settle    = 26'h0;
 reg [12:0] walker_addr      = 13'h0;
 reg [7:0]  walker_xor       = 8'h0;
@@ -326,8 +324,8 @@ wire [7:0] mcu_db_in = ~mcu_psen_n ? mcurom_D       :
 t8039_notri i8039_mcu (
 	.xtal_i(clk_8m),
 	.xtal_en_i(~pause),
-	// DIAG-REVERT-2026-05-25: hold 8039 in reset while the ROM walker
-	// runs. This was the configuration that produced working DAC audio.
+	// DIAG-REVERT-2026-05-25: gated by walker_done to hold 8039 in reset
+	// for ~10s after boot. Required for DAC to start cleanly.
 	.reset_n_i(reset & walker_done),
 	// T0 / T1 tied LOW to match the working Gyruss core (which leaves these
 	// ports unconnected → VHDL/Verilog default = 0).
@@ -401,50 +399,27 @@ jt49_bus #(.COMP(3'b100)) AY1
 // For initial implementation, no dynamic filter switching — just DC removal.
 // TODO: Add switchable RC filters for accuracy.
 
-//------------------------------------------------------- DAC output --------------------------------------------------------//
-
-// i8039 P1 -> 8-bit R2R DAC (100K/200K ladder)
-// Convert unsigned 8-bit to signed 16-bit
-wire signed [15:0] dac_sound = {~mcu_p1_out[7], mcu_p1_out[6:0], 8'd0};
-
 //------------------------------------------------------- Audio mixing ------------------------------------------------------//
 
-// DC offset removal for AY channels
-wire signed [15:0] ayA_dcrm, ayB_dcrm, ayC_dcrm;
+// DC offset removal — both AY voices and the DAC are fed UNSIGNED 16-bit
+// to jt49_dcrm2 (see filter header: "input is unsigned"). The filter
+// outputs signed AC content centered around 0. Feeding signed input here
+// confuses the integrator and severely attenuates / distorts the output.
+wire signed [15:0] ayA_dcrm, ayB_dcrm, ayC_dcrm, dac_dcrm;
 
-jt49_dcrm2 #(16) dcrm_A (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
-                          .din({3'd0, ayA_raw, 5'd0}), .dout(ayA_dcrm));
-jt49_dcrm2 #(16) dcrm_B (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
-                          .din({3'd0, ayB_raw, 5'd0}), .dout(ayB_dcrm));
-jt49_dcrm2 #(16) dcrm_C (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
-                          .din({3'd0, ayC_raw, 5'd0}), .dout(ayC_dcrm));
-
-// FIX-2026-05-24: DAC needs DC removal too — real hardware AC-couples the
-// audio analog-side, but our digital mix sums raw. Without this, a stuck
-// P1=0xFF (8039 not running) injects +32512 DC into the mix and eats most
-// of the dynamic range → AYs clip on positive peaks. Even when the 8039
-// runs correctly, typical 8-bit unsigned samples bias around mid-scale and
-// would still benefit from being centered.
-// FIX-2026-05-25: jt49_dcrm2 expects UNSIGNED input ("input is unsigned" per
-// its header comment). Previously we fed dac_sound (signed, with the MSB
-// flipped to convert P1 to signed range), which the filter interpreted as
-// unsigned with a discontinuity at the sign boundary → filter integrator
-// thrashed and the AC output was attenuated / distorted. Feed raw P1
-// shifted to the high byte (matches the pattern used by the AY voices).
-wire signed [15:0] dac_dcrm;
+jt49_dcrm2 #(16) dcrm_A   (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                            .din({3'd0, ayA_raw, 5'd0}), .dout(ayA_dcrm));
+jt49_dcrm2 #(16) dcrm_B   (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                            .din({3'd0, ayB_raw, 5'd0}), .dout(ayB_dcrm));
+jt49_dcrm2 #(16) dcrm_C   (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
+                            .din({3'd0, ayC_raw, 5'd0}), .dout(ayC_dcrm));
 jt49_dcrm2 #(16) dcrm_DAC (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
-                            .din({mcu_p1_out, 8'd0}), .dout(dac_dcrm));
+                            .din({mcu_p1_out, 8'd0}),    .dout(dac_dcrm));
 
-// DIAG-REVERT-2026-05-25e: full mix with DAC boosted ×4. AY voices were
-// audible but DAC was way too quiet at unity gain — typical because the
-// 8039 doesn't drive P1 across the full 0..255 range, so dac_dcrm AC
-// content is narrow vs the 3-voice AY sum.
-// Earlier mixes (kept for revert):
-// wire signed [17:0] mix = {dac_sound[15], dac_sound[15], dac_sound} <<< 3; // DAC-only
-// wire signed [17:0] mix = {dac_sound[15], dac_sound[15], dac_sound}
-//                        + ayA_dcrm + ayB_dcrm + ayC_dcrm;                  // raw P1 + AY (saturated)
-// wire signed [17:0] mix = ayA_dcrm + ayB_dcrm + ayC_dcrm
-//                        + {dac_dcrm[15], dac_dcrm[15], dac_dcrm};          // unity DAC (too quiet)
+// Mix: 3 AY voices + DAC, all DC-removed and signed. DAC at unity gain
+// (subjectively balanced against AY 2026-05-25). MAME reference ratios
+// are AY=0.30 per voice, DAC=0.25, which would put DAC quieter than the
+// three-voice AY sum — close to what unity gives us here.
 wire signed [17:0] dac_18 = {dac_dcrm[15], dac_dcrm[15], dac_dcrm};
 wire signed [17:0] mix    = ayA_dcrm + ayB_dcrm + ayC_dcrm + dac_18;
 
@@ -452,14 +427,9 @@ wire signed [17:0] mix    = ayA_dcrm + ayB_dcrm + ayC_dcrm + dac_18;
 wire signed [15:0] sound_raw = (mix > 18'sd32767)  ? 16'sd32767 :
                                (mix < -18'sd32768) ? -16'sd32768 :
                                mix[15:0];
-
-// DIAG-REVERT-2026-05-25c: routing through sound_raw now uses the
-// "raw P1 + AY" mix above. Hijack disabled to let AY mix in.
-// Hijack reference (in case we need to revert again):
-// assign sound = pause ? 16'sd0 : {~mcu_p1_out[7], mcu_p1_out[6:0], 8'd0};
 assign sound = pause ? 16'sd0 : sound_raw;
 
-// DIAG-REVERT-2026-05-25: LED_USER reports walker XOR match (8'h37).
-assign debug_p1 = {mcu_p2_out[7], mcu_irq_latch_n, mcu_p1_out[5:1], rom_xor_match};
+// debug_p1 output kept as a hook for future probes; tied off for now.
+assign debug_p1 = 8'h00;
 
 endmodule

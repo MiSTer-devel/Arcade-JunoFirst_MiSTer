@@ -209,15 +209,8 @@ assign AUDIO_MIX = 0;
 
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
-// CLK_8M blink test (DIAG-REVERT-2026-05-24, verified 2026-05-24) passed —
-// PLL is exactly 8 MHz. Restoring P1 activity indicator: lights during
-// ROM load, then toggles rapidly whenever the 8039 writes DAC samples.
-// LED steady-off after boot = 8039 not running. LED flickering = 8039 alive.
-//reg [22:0] clk8m_blink_cnt = 0;
-//always @(posedge CLK_8M) clk8m_blink_cnt <= clk8m_blink_cnt + 1'b1;
-//assign LED_USER = clk8m_blink_cnt[22];
-//assign LED_USER  = ioctl_download;
-assign LED_USER  = ioctl_download | debug_p1[0];
+// Standard MiSTer convention: LED_USER lights during ROM load, off otherwise.
+assign LED_USER = ioctl_download;
 assign BUTTONS = 0;
 
 ///////////////////////////////////////////////////
@@ -391,7 +384,11 @@ always @(posedge CLK_50M) begin
 	end
 end
 
-wire reset = RESET | status[0] | buttons[1];
+// FIX-2026-05-25: ioctl_download + PLL locks in the reset chain — proper
+// cold-boot guard so the 8039 (and Z80) aren't released while ROMs are
+// still streaming into BRAM or before PLLs are settled. See Common-Pitfalls/
+// Core reset must include ioctl_download.md.
+wire reset = RESET | status[0] | buttons[1] | ioctl_download | ~snd_pll_locked | ~locked;
 
 ///////////////////         Keyboard           //////////////////
 
