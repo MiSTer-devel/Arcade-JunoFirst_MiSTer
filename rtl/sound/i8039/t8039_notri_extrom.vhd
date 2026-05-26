@@ -1,51 +1,28 @@
 -------------------------------------------------------------------------------
 --
--- T8039 Microcontroller System
--- 8039 toplevel without tri-states
+-- T8039 Microcontroller — toplevel WITH external program ROM port
 --
--- Copyright (c) 2004, Arnim Laeuger (arniml@opencores.org)
+-- Derived from Arnim Laeuger's t8039_notri.vhd (the T48 author's reference
+-- 8039 toplevel, opencores). This variant exposes the program-memory bus
+-- (pmem_addr_o / pmem_data_i) so an external program ROM can be wired in,
+-- and parameterises the internal data RAM size:
+--   ram_addr_width_g = 7  -> 128 bytes (8039)
+--   ram_addr_width_g = 6  -> 64  bytes (8035)
 --
--- All rights reserved
---
--- Redistribution and use in source and synthezised forms, with or without
--- modification, are permitted provided that the following conditions are met:
---
--- Redistributions of source code must retain the above copyright notice,
--- this list of conditions and the following disclaimer.
---
--- Redistributions in synthesized form must reproduce the above copyright
--- notice, this list of conditions and the following disclaimer in the
--- documentation and/or other materials provided with the distribution.
---
--- Neither the name of the author nor the names of other contributors may
--- be used to endorse or promote products derived from this software without
--- specific prior written permission.
---
--- THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
--- AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
--- THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
--- PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE
--- LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
--- CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
--- SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
--- INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
--- CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
--- ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
--- POSSIBILITY OF SUCH DAMAGE.
---
--- Please report bugs to the author, but before you do so, please
--- make sure that this is not a derivative work and that
--- you have the latest version of this file.
+-- Everything else (clock/reset/xtal3 loopback contract, port input gating)
+-- is preserved verbatim from the reference toplevel — the whole point of
+-- using this wrapper is to inherit the author-blessed t48_core port map.
 --
 -------------------------------------------------------------------------------
 
 library ieee;
 use ieee.std_logic_1164.all;
 
-entity t8039_notri is
+entity t8039_notri_extrom is
 
   generic (
-    gate_port_input_g : integer := 1
+    gate_port_input_g : integer := 1;
+    ram_addr_width_g  : integer := 7   -- 7 = 128B (8039), 6 = 64B (8035)
   );
 
   port (
@@ -72,30 +49,39 @@ entity t8039_notri is
     p1_i          : in  std_logic_vector( 7 downto 0);
     p1_o          : out std_logic_vector( 7 downto 0);
     p1_low_imp_o  : out std_logic;
-    prog_n_o      : out std_logic
+    prog_n_o      : out std_logic;
+    -- External program ROM bus
+    pmem_addr_o   : out std_logic_vector(11 downto 0);
+    pmem_data_i   : in  std_logic_vector( 7 downto 0)
   );
 
-end t8039_notri;
+end t8039_notri_extrom;
 
 
 library ieee;
 use ieee.numeric_std.all;
 
-architecture struct of t8039_notri is
+use work.t48_core_comp_pack.t48_core;
+use work.t48_core_comp_pack.generic_ram_ena;
+
+architecture struct of t8039_notri_extrom is
 
   signal xtal3_s          : std_logic;
   signal dmem_addr_s      : std_logic_vector( 7 downto 0);
   signal dmem_we_s        : std_logic;
   signal dmem_data_from_s : std_logic_vector( 7 downto 0);
   signal dmem_data_to_s   : std_logic_vector( 7 downto 0);
-  signal pmem_data_s      : std_logic_vector( 7 downto 0);
 
   signal p1_in_s,
          p1_out_s         : std_logic_vector( 7 downto 0);
   signal p2_in_s,
          p2_out_s         : std_logic_vector( 7 downto 0);
 
+  signal vdd_s            : std_logic;
+
 begin
+
+  vdd_s <= '1';
 
   -----------------------------------------------------------------------------
   -- Check generics for valid values.
@@ -104,14 +90,13 @@ begin
   assert gate_port_input_g = 0 or gate_port_input_g = 1
     report "gate_port_input_g must be either 1 or 0!"
     severity failure;
+  assert ram_addr_width_g = 6 or ram_addr_width_g = 7
+    report "ram_addr_width_g must be 6 (8035, 64B) or 7 (8039, 128B)!"
+    severity failure;
   -- pragma translate_on
 
 
-  -- no Program memory available
-  pmem_data_s <= (others => '0');
-
-
-  t48_core_b : entity work.t48_core
+  t48_core_b : t48_core
     generic map (
       xtal_div_3_g        => 1,
       register_mnemonic_g => 1,
@@ -153,8 +138,8 @@ begin
       dmem_we_o     => dmem_we_s,
       dmem_data_i   => dmem_data_from_s,
       dmem_data_o   => dmem_data_to_s,
-      pmem_addr_o   => open,
-      pmem_data_i   => pmem_data_s
+      pmem_addr_o   => pmem_addr_o,
+      pmem_data_i   => pmem_data_i
     );
 
 
@@ -169,22 +154,22 @@ begin
   pass_ports: if gate_port_input_g = 0 generate
     p1_in_s <= p1_i;
     p2_in_s <= p2_i;
-  end generate;  
+  end generate;
 
   p1_o <= p1_out_s;
   p2_o <= p2_out_s;
 
 
-  ram_128_b : entity work.generic_ram_ena
+  ram_b : generic_ram_ena
     generic map (
-      addr_width_g => 7,
+      addr_width_g => ram_addr_width_g,
       data_width_g => 8
     )
     port map (
       clk_i => xtal_i,
-      a_i   => dmem_addr_s(6 downto 0),
+      a_i   => dmem_addr_s(ram_addr_width_g - 1 downto 0),
       we_i  => dmem_we_s,
-      ena_i => '1',
+      ena_i => vdd_s,
       d_i   => dmem_data_to_s,
       d_o   => dmem_data_from_s
     );

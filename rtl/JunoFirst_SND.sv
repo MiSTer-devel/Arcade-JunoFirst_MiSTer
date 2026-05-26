@@ -235,16 +235,62 @@ end
 wire [7:0] mcu_db_o;
 wire [7:0] mcu_p1_out;
 wire [7:0] mcu_p2_out;
-wire mcu_rd_n;
+wire       mcu_rd_n;
+wire       mcu_psen_n;
+wire       mcu_ale;
 
-// t48_core provides direct pmem_addr_o (12-bit) — no ALE latching needed!
-wire [11:0] mcu_prog_addr;
+// Program-fetch address = {P2[3:0], ALE-latched db_o[7:0]} (canonical MCS-48
+// multiplexed bus — matches the working Gyruss core's GYRUSS_SOUND.v:473-477).
+reg  [7:0] mcu_pcad_latch = 8'h00;
+always @(negedge mcu_ale) mcu_pcad_latch <= mcu_db_o;
+wire [11:0] mcu_prog_addr = {mcu_p2_out[3:0], mcu_pcad_latch};
 
 // MCU ROM (4KB) - jfs2_p4.bin
 wire [7:0] mcurom_D;
+
+// DIAG-REVERT-2026-05-25: ROM-integrity walker. After a settle delay,
+// sweeps all 4096 addresses on clk_8m, XORing each byte. Expected XOR
+// signature for jfs2_p4.bin = 8'h37. LED reports match post-walk. During
+// the walk the 8039 is held in reset (see reset_n_i wiring on the
+// t8039_notri instance below). The 10-second reset hold is what made
+// the DAC work — its precise role is still being investigated.
+reg [25:0] walker_settle    = 26'h0;
+reg [12:0] walker_addr      = 13'h0;
+reg [7:0]  walker_xor       = 8'h0;
+reg        walker_done      = 1'b0;
+reg [1:0]  walker_state     = 2'h0;
+wire       walker_running   = (&walker_settle) & ~walker_done;
+always @(posedge clk_8m) begin
+    if (!reset) begin
+        walker_settle <= 26'h0;
+        walker_addr   <= 13'h0;
+        walker_xor    <= 8'h0;
+        walker_done   <= 1'b0;
+        walker_state  <= 2'h0;
+    end else if (!(&walker_settle)) begin
+        walker_settle <= walker_settle + 26'h1;
+    end else if (!walker_done) begin
+        case (walker_state)
+            2'd0: walker_state <= 2'd1;
+            2'd1: begin
+                walker_xor   <= walker_xor ^ mcurom_D;
+                walker_state <= 2'd2;
+            end
+            2'd2: begin
+                if (walker_addr == 13'd4095) walker_done <= 1'b1;
+                walker_addr  <= walker_addr + 13'h1;
+                walker_state <= 2'd0;
+            end
+            default: walker_state <= 2'd0;
+        endcase
+    end
+end
+wire        rom_xor_match = walker_done & (walker_xor == 8'h37);
+wire [11:0] mcurom_addr   = walker_running ? walker_addr[11:0] : mcu_prog_addr;
+
 eprom_4k mcu_rom
 (
-	.ADDR(mcu_prog_addr),
+	.ADDR(mcurom_addr),
 	.CLK(clk_8m),
 	.DATA(mcurom_D),
 	.ADDR_DL(ioctl_addr),
@@ -254,110 +300,58 @@ eprom_4k mcu_rom
 	.WR(mcurom_wr)
 );
 
-// MCU internal RAM (128 bytes for 8039)
-wire [7:0] mcu_dmem_addr;
-wire mcu_dmem_we;
-wire [7:0] mcu_dmem_din;
-wire [7:0] mcu_dmem_dout;
-
-spram #(8, 7) mcu_ram   // 8-bit wide, 7-bit address = 128 bytes
-(
-	.clk(clk_8m),
-	.we(mcu_dmem_we),
-	.addr(mcu_dmem_addr[6:0]),
-	.data(mcu_dmem_dout),
-	.q(mcu_dmem_din)
-);
-
-// MCU external data bus: MOVX reads return soundlatch2
-// Sync into clk_8m domain (soundlatch2 written on clk_49m)
+// Sound command latch (Z80 -> 8039 via MOVX). Cross from clk_49m to clk_8m.
 reg [7:0] soundlatch2_sync1, soundlatch2_sync2;
 always_ff @(posedge clk_8m) begin
     soundlatch2_sync1 <= soundlatch2;
     soundlatch2_sync2 <= soundlatch2_sync1;
 end
-wire [7:0] mcu_db_in = soundlatch2_sync2;
 
-// Register xtal3_o to break combinational loop — feeds back to en_clk_i
-// This gives the state machine exactly 1 advance per 3 crystal clocks
-// Result: 8 MHz / 3 / 5 = 533.33 kHz machine cycle (exact match to real i8039)
-wire xtal3_raw;
-reg xtal3_reg = 0;
-always_ff @(posedge clk_8m) begin
-	xtal3_reg <= xtal3_raw;
-end
+// db_i mux (Gyruss GYRUSS_SOUND.v:479):
+//   PSEN_n asserted → program ROM byte
+//   RD_n   asserted → soundlatch2 (MOVX read of Z80 command)
+//   else            → 8'hFF (pull-ups)
+wire [7:0] mcu_db_in = ~mcu_psen_n ? mcurom_D       :
+                      ~mcu_rd_n   ? soundlatch2_sync2 :
+                                    8'hFF;
 
-t48_core #(
-	.xtal_div_3_g(1),
-	.register_mnemonic_g(1),
-	.include_port1_g(1),
-	.include_port2_g(1),
-	.include_bus_g(1),
-	.include_timer_g(1),
-	.sample_t1_state_g(4)
-) i8039_mcu (
-	// Crystal / clock
+// 8039 via t8039_notri — Arnim Laeuger's canonical 8039 toplevel. Wraps
+// t48_core with the correct xtal3 loopback / reset-polarity / RAM contract,
+// and exposes the multiplexed MCS-48 bus (ale_o / psen_n_o / rd_n_o / wr_n_o /
+// db). External program ROM is fetched via db_i gated by psen_n, just like
+// real hardware and like the working Gyruss core.
+//
+// gate_port_input_g defaults to 1 (real 8039 quasi-bidirectional port
+// behavior: p1_i / p2_i AND'd with the output register).
+t8039_notri i8039_mcu (
 	.xtal_i(clk_8m),
 	.xtal_en_i(~pause),
-	// DIAG-REVERT-2026-05-24: original below, uncomment to restore.
-	// Comment claimed reset_i is active-HIGH; it is in fact active-LOW
-	// (res_active_c='0' in t48_pack-p.vhd). The local `reset` signal in this
-	// module is ALSO active-low — top-level Arcade-JunoFirst.sv:517 inverts
-	// the active-high MiSTer reset into JunoFirst, which passes through to
-	// JunoFirst_SND unchanged; confirmed by all `if(!reset)` always_ffs and
-	// AY's .rst_n(reset) wiring. So .reset_i(~reset) was active-HIGH going
-	// into an active-LOW port, holding the 8039 in reset during normal
-	// operation. Same bug class as SegaG80 FIX-2026-05-20.
-	// .reset_i(~reset),              // Active HIGH reset
-	.reset_i(reset),                  // DIAG: pass active-low through to active-low reset_i
-	// Test pins
-	.t0_i(1'b1),
+	// DIAG-REVERT-2026-05-25: hold 8039 in reset while the ROM walker
+	// runs. This was the configuration that produced working DAC audio.
+	.reset_n_i(reset & walker_done),
+	// T0 / T1 tied LOW to match the working Gyruss core (which leaves these
+	// ports unconnected → VHDL/Verilog default = 0).
+	.t0_i(1'b0),
 	.t0_o(),
 	.t0_dir_o(),
-	.t1_i(1'b1),
-	// Interrupt
+	.t1_i(1'b0),
 	.int_n_i(mcu_irq_latch_n),
-	// External access = always external ROM for 8039
-	.ea_i(1'b1),
-	// Bus control
+	.ea_i(1'b1),                      // external program ROM (8039 has no internal ROM)
 	.rd_n_o(mcu_rd_n),
-	.psen_n_o(),
+	.psen_n_o(mcu_psen_n),
 	.wr_n_o(),
-	.ale_o(),
-	// External data bus (for MOVX instructions)
+	.ale_o(mcu_ale),
 	.db_i(mcu_db_in),
 	.db_o(mcu_db_o),
 	.db_dir_o(),
-	// Port 1: DAC output
 	.p1_i(8'hFF),
 	.p1_o(mcu_p1_out),
 	.p1_low_imp_o(),
-	// Port 2: status + IRQ control
 	.p2_i(8'hFF),
 	.p2_o(mcu_p2_out),
 	.p2l_low_imp_o(),
 	.p2h_low_imp_o(),
-	// PROG pin
-	.prog_n_o(),
-	// System clock domain
-	.clk_i(clk_8m),
-	// DIAG-REVERT-2026-05-24: original below, uncomment to restore.
-	// Audit of t48 clock_ctrl.vhd shows no comb loop exists and en_clk_i must
-	// be a 1-cycle pulse per xtal3 event — i.e. xtal3_o looped *directly*.
-	// The ~xtal3_reg pattern asserts en_clk_i 2 of every 3 clk_8m cycles,
-	// scrambling the MSTATE FSM vs the ALE/RD/WR generator → 8039 executes
-	// garbage → P1 never moves → DAC silent (the observed JF symptom).
-	// .en_clk_i(~xtal3_reg),
-	.en_clk_i(xtal3_raw),   // DIAG: direct xtal3_o loopback (matches SegaG80 FIX-2026-05-20)
-	.xtal3_o(xtal3_raw),
-	// Internal RAM (128 bytes)
-	.dmem_addr_o(mcu_dmem_addr),
-	.dmem_we_o(mcu_dmem_we),
-	.dmem_data_i(mcu_dmem_din),
-	.dmem_data_o(mcu_dmem_dout),
-	// Program ROM (4KB direct interface)
-	.pmem_addr_o(mcu_prog_addr),
-	.pmem_data_i(mcurom_D)
+	.prog_n_o()
 );
 
 // i8039 status fed back to Z80 via AY port A (bits 2:0)
@@ -431,58 +425,41 @@ jt49_dcrm2 #(16) dcrm_C (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
 // of the dynamic range → AYs clip on positive peaks. Even when the 8039
 // runs correctly, typical 8-bit unsigned samples bias around mid-scale and
 // would still benefit from being centered.
+// FIX-2026-05-25: jt49_dcrm2 expects UNSIGNED input ("input is unsigned" per
+// its header comment). Previously we fed dac_sound (signed, with the MSB
+// flipped to convert P1 to signed range), which the filter interpreted as
+// unsigned with a discontinuity at the sign boundary → filter integrator
+// thrashed and the AC output was attenuated / distorted. Feed raw P1
+// shifted to the high byte (matches the pattern used by the AY voices).
 wire signed [15:0] dac_dcrm;
 jt49_dcrm2 #(16) dcrm_DAC (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
-                            .din(dac_sound), .dout(dac_dcrm));
+                            .din({mcu_p1_out, 8'd0}), .dout(dac_dcrm));
 
-// Mix AY (3 channels at 0.30 each from MAME) + DAC (0.25 from MAME)
-// DIAG-REVERT-2026-05-24: restored full AY+DAC mix so AYs are audible while
-// the DAC path is still being debugged. Originally muted to test DAC in
-// isolation (see April-16 chat: "limiting of output to dac only was to test
-// the dac which was outputting ABSOLUTELY NOTHING"). To re-isolate DAC-only,
-// re-enable the `<<< 3` line and comment out the active mix.
-wire signed [17:0] mix = ayA_dcrm + ayB_dcrm + ayC_dcrm
-                       + {dac_dcrm[15], dac_dcrm[15], dac_dcrm};
-// DIAG: DAC-only test lines, kept for easy isolation:
-//wire signed [17:0] mix = (ayA_dcrm + ayB_dcrm + ayC_dcrm) <<< 3;
-//wire signed [17:0] mix = {dac_sound[15], dac_sound[15], dac_sound} <<< 3;
+// DIAG-REVERT-2026-05-25e: full mix with DAC boosted ×4. AY voices were
+// audible but DAC was way too quiet at unity gain — typical because the
+// 8039 doesn't drive P1 across the full 0..255 range, so dac_dcrm AC
+// content is narrow vs the 3-voice AY sum.
+// Earlier mixes (kept for revert):
+// wire signed [17:0] mix = {dac_sound[15], dac_sound[15], dac_sound} <<< 3; // DAC-only
+// wire signed [17:0] mix = {dac_sound[15], dac_sound[15], dac_sound}
+//                        + ayA_dcrm + ayB_dcrm + ayC_dcrm;                  // raw P1 + AY (saturated)
+// wire signed [17:0] mix = ayA_dcrm + ayB_dcrm + ayC_dcrm
+//                        + {dac_dcrm[15], dac_dcrm[15], dac_dcrm};          // unity DAC (too quiet)
+wire signed [17:0] dac_18 = {dac_dcrm[15], dac_dcrm[15], dac_dcrm};
+wire signed [17:0] mix    = ayA_dcrm + ayB_dcrm + ayC_dcrm + dac_18;
 
 // Saturate to 16-bit signed
 wire signed [15:0] sound_raw = (mix > 18'sd32767)  ? 16'sd32767 :
                                (mix < -18'sd32768) ? -16'sd32768 :
                                mix[15:0];
+
+// DIAG-REVERT-2026-05-25c: routing through sound_raw now uses the
+// "raw P1 + AY" mix above. Hijack disabled to let AY mix in.
+// Hijack reference (in case we need to revert again):
+// assign sound = pause ? 16'sd0 : {~mcu_p1_out[7], mcu_p1_out[6:0], 8'd0};
 assign sound = pause ? 16'sd0 : sound_raw;
 
-//assign debug_p1 = mcu_prog_addr[7:0];
-//assign debug_p1 = {mcu_p2_out[7], mcu_irq_latch_n, mcu_p1_out[5:0]};
-
-// DIAG-REVERT-2026-05-24: PC-change "8039 alive" detector — replaces the
-// P1[0] indicator on LED_USER. The previous indicator was ambiguous (LED
-// solid could mean stuck-in-reset OR alive-but-P1-not-changing). This one
-// samples mcu_prog_addr every ~1 second; if PC moved since last sample,
-// the 8039 ran during that window. Result is ANDed with a slow blink so
-// alive = visible ~0.5 Hz blink, dead = LED off.
-//
-// LED behavior interpretation:
-//   * Visible ~0.5 Hz blink → 8039 is executing instructions (alive)
-//   * Solid OFF             → 8039 is stuck / in reset / not clocked
-//   * Solid ON              → bug in this diagnostic (shouldn't happen)
-//
-// Restore the previous indicator by uncommenting the line above and
-// removing this block.
-reg [11:0] pc_prev_sample = 12'h0;
-reg        pc_alive = 1'b0;
-reg [22:0] pc_check_div = 23'h0;
-reg [23:0] visible_blink_div = 24'h0;
-always @(posedge clk_8m) begin
-    pc_check_div      <= pc_check_div + 23'h1;
-    visible_blink_div <= visible_blink_div + 24'h1;
-    if (pc_check_div == 23'h0) begin
-        pc_alive       <= (mcu_prog_addr != pc_prev_sample);
-        pc_prev_sample <= mcu_prog_addr;
-    end
-end
-wire mcu_alive_led = pc_alive & visible_blink_div[23];
-assign debug_p1 = {mcu_p2_out[7], mcu_irq_latch_n, mcu_p1_out[5:1], mcu_alive_led};
+// DIAG-REVERT-2026-05-25: LED_USER reports walker XOR match (8'h37).
+assign debug_p1 = {mcu_p2_out[7], mcu_irq_latch_n, mcu_p1_out[5:1], rom_xor_match};
 
 endmodule
