@@ -239,25 +239,63 @@ wire       mcu_rd_n;
 wire       mcu_psen_n;
 wire       mcu_ale;
 
-// Program-fetch address = {P2[3:0], ALE-latched db_o[7:0]} (canonical MCS-48
-// multiplexed bus — matches the working Gyruss core's GYRUSS_SOUND.v:473-477).
+// Program-fetch address reconstruction. Real 8039 multiplexes the low 8
+// bits of the PC onto db_o[7:0] during ALE-high, and outputs the high
+// 4 bits on P2[3:0] during fetch cycles. We latch db_o on the falling
+// edge of ALE and concatenate with P2[3:0] to form the 12-bit address
+// fed to mcu_rom. Pattern matches Gyruss (GYRUSS_SOUND.v:473-477).
 reg  [7:0] mcu_pcad_latch = 8'h00;
 always @(negedge mcu_ale) mcu_pcad_latch <= mcu_db_o;
 wire [11:0] mcu_prog_addr = {mcu_p2_out[3:0], mcu_pcad_latch};
 
-// MCU ROM (4KB) - jfs2_p4.bin
+// MCU ROM (4KB) — jfs2_p4.bin loaded via ioctl_index=2.
 wire [7:0] mcurom_D;
+eprom_4k mcu_rom
+(
+	.ADDR(mcu_prog_addr),
+	.CLK(clk_8m),
+	.DATA(mcurom_D),
+	.ADDR_DL(ioctl_addr),
+	.CLK_DL(clk_49m),
+	.DATA_IN(ioctl_data),
+	.CS_DL(mcurom_cs_i),
+	.WR(mcurom_wr)
+);
 
-// DIAG-REVERT-2026-05-25: ROM-integrity walker (10s settle + XOR sweep).
-// Holds 8039 in reset for ~10s after main reset deasserts; required for
-// cold-boot to work reliably even with ioctl_download+PLL-lock in the reset
-// chain. The precise mechanism is still unknown — see lessons-learned note.
-reg [25:0] walker_settle    = 26'h0;
-reg [12:0] walker_addr      = 13'h0;
-reg [7:0]  walker_xor       = 8'h0;
-reg        walker_done      = 1'b0;
-reg [1:0]  walker_state     = 2'h0;
-wire       walker_running   = (&walker_settle) & ~walker_done;
+//-------------------- 8039 COLD-BOOT WORKAROUND ----------------------------//
+//
+// The 8039 will not start cleanly even with the proper reset chain in the
+// top wrapper (ioctl_download | ~snd_pll_locked | ~locked). It needs an
+// additional ~10 s of reset hold beyond that — without it, DAC stays
+// silent for the life of the session ("cold-boot bug"). Manual reset via
+// status[0] after boot does NOT recover (untested at time of fix — left
+// as a future-session diagnostic if curiosity strikes).
+//
+// We don't know why. Real arcade hardware doesn't need this delay; the
+// 8039's pins on the JF schematic are wired identically to our setup
+// (T0/T1 are floating NC, /EA pulled to VCC, /RESET from the system
+// reset network, /INT from a 74LS74 we faithfully model). Empirically:
+//   ~10 s: reliable
+//   ~1-2 s (just ioctl_download + PLL locks): broken
+// The threshold between those points hasn't been binary-searched.
+//
+// The FSM below has two phases:
+//   1. Settle counter: 2^26 clk_8m cycles ≈ 8.4 s of pre-walk delay.
+//   2. ROM walk: 4096-byte sweep XOR'd into walker_xor over ~1.5 ms.
+//      Originally a ROM-integrity self-check (matches against the
+//      expected XOR signature 0x37 for jfs2_p4.bin), but the LED that
+//      reported the result is no longer routed — walker_xor / rom_xor_match
+//      synthesize away. What matters is that walker_done stays LOW for
+//      the full ~10 s and then latches HIGH to release the 8039 below.
+//
+// Do not "clean up" this block by replacing it with a plain delay counter
+// without testing — the precise effect on cold-boot timing isn't fully
+// understood and the current FSM is the empirically-validated workaround.
+reg [25:0] walker_settle = 26'h0;
+reg [12:0] walker_addr   = 13'h0;
+reg [7:0]  walker_xor    = 8'h0;
+reg        walker_done   = 1'b0;
+reg [1:0]  walker_state  = 2'h0;
 always @(posedge clk_8m) begin
     if (!reset) begin
         walker_settle <= 26'h0;
@@ -283,20 +321,7 @@ always @(posedge clk_8m) begin
         endcase
     end
 end
-wire        rom_xor_match = walker_done & (walker_xor == 8'h37);
-wire [11:0] mcurom_addr   = walker_running ? walker_addr[11:0] : mcu_prog_addr;
-
-eprom_4k mcu_rom
-(
-	.ADDR(mcurom_addr),
-	.CLK(clk_8m),
-	.DATA(mcurom_D),
-	.ADDR_DL(ioctl_addr),
-	.CLK_DL(clk_49m),
-	.DATA_IN(ioctl_data),
-	.CS_DL(mcurom_cs_i),
-	.WR(mcurom_wr)
-);
+//---------------------------------------------------------------------------//
 
 // Sound command latch (Z80 -> 8039 via MOVX). Cross from clk_49m to clk_8m.
 reg [7:0] soundlatch2_sync1, soundlatch2_sync2;
@@ -305,30 +330,31 @@ always_ff @(posedge clk_8m) begin
     soundlatch2_sync2 <= soundlatch2_sync1;
 end
 
-// db_i mux (Gyruss GYRUSS_SOUND.v:479):
-//   PSEN_n asserted → program ROM byte
-//   RD_n   asserted → soundlatch2 (MOVX read of Z80 command)
-//   else            → 8'hFF (pull-ups)
-wire [7:0] mcu_db_in = ~mcu_psen_n ? mcurom_D       :
+// Multiplexed bus input to the 8039:
+//   /PSEN asserted → program ROM byte (instruction fetch)
+//   /RD   asserted → soundlatch2 (8039 MOVX read of Z80-side command)
+//   else           → 8'hFF (idle pull-ups)
+// MAME's mcu_io_map maps 0x00-0xFF all to soundlatch2, so any MOVX read
+// returns the command byte regardless of the address phase value.
+wire [7:0] mcu_db_in = ~mcu_psen_n ? mcurom_D         :
                       ~mcu_rd_n   ? soundlatch2_sync2 :
                                     8'hFF;
 
-// 8039 via t8039_notri — Arnim Laeuger's canonical 8039 toplevel. Wraps
-// t48_core with the correct xtal3 loopback / reset-polarity / RAM contract,
-// and exposes the multiplexed MCS-48 bus (ale_o / psen_n_o / rd_n_o / wr_n_o /
-// db). External program ROM is fetched via db_i gated by psen_n, just like
-// real hardware and like the working Gyruss core.
+// 8039 instance via Arnim Laeuger's canonical t8039_notri wrapper. The
+// wrapper internally handles the T48 contract (clk_i==xtal_i, xtal3_o
+// looped back to en_clk_i, internal 128-byte RAM, active-low reset).
+// Gyruss-style multiplexed MCS-48 bus: ale_o + psen_n_o + db_i/db_o
+// (external program ROM is fetched through db_i gated by psen_n; MOVX
+// reads come through db_i gated by rd_n).
 //
-// gate_port_input_g defaults to 1 (real 8039 quasi-bidirectional port
-// behavior: p1_i / p2_i AND'd with the output register).
+// reset_n_i is gated by walker_done — cold-boot workaround documented
+// above. T0/T1 are pin-1 / pin-39 on the real 8039 — NC on the JF
+// schematic, but we tie to 0 to match the working Gyruss reference;
+// MAME's junofrst.cpp does not bind T0/T1 callbacks either.
 t8039_notri i8039_mcu (
 	.xtal_i(clk_8m),
 	.xtal_en_i(~pause),
-	// DIAG-REVERT-2026-05-25: gated by walker_done to hold 8039 in reset
-	// for ~10s after boot. Required for DAC to start cleanly.
 	.reset_n_i(reset & walker_done),
-	// T0 / T1 tied LOW to match the working Gyruss core (which leaves these
-	// ports unconnected → VHDL/Verilog default = 0).
 	.t0_i(1'b0),
 	.t0_o(),
 	.t0_dir_o(),
@@ -401,10 +427,17 @@ jt49_bus #(.COMP(3'b100)) AY1
 
 //------------------------------------------------------- Audio mixing ------------------------------------------------------//
 
-// DC offset removal — both AY voices and the DAC are fed UNSIGNED 16-bit
-// to jt49_dcrm2 (see filter header: "input is unsigned"). The filter
-// outputs signed AC content centered around 0. Feeding signed input here
-// confuses the integrator and severely attenuates / distorts the output.
+// DC-block on every audio source before the mix.
+//
+// IMPORTANT: jt49_dcrm2 requires UNSIGNED input — per the module header,
+// "input is unsigned". The integrator interprets the bit pattern as
+// unsigned even when the source is conceptually signed, so feeding a
+// signed value (with its MSB-as-sign discontinuity) produces a chaotic
+// integrator state and the AC output is heavily attenuated / distorted.
+//
+// AY voices: 8-bit unsigned (0..255) shifted into a 16-bit unsigned
+// position. DAC: raw 8-bit unsigned P1 shifted into the upper byte.
+// Both come out of the filter as 16-bit signed AC centered around 0.
 wire signed [15:0] ayA_dcrm, ayB_dcrm, ayC_dcrm, dac_dcrm;
 
 jt49_dcrm2 #(16) dcrm_A   (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
@@ -416,10 +449,10 @@ jt49_dcrm2 #(16) dcrm_C   (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
 jt49_dcrm2 #(16) dcrm_DAC (.clk(clk_49m), .cen(cen_dcrm), .rst(~reset),
                             .din({mcu_p1_out, 8'd0}),    .dout(dac_dcrm));
 
-// Mix: 3 AY voices + DAC, all DC-removed and signed. DAC at unity gain
-// (subjectively balanced against AY 2026-05-25). MAME reference ratios
-// are AY=0.30 per voice, DAC=0.25, which would put DAC quieter than the
-// three-voice AY sum — close to what unity gives us here.
+// Mix: 3 AY voices + DAC, all DC-removed signed 16-bit, sign-extended
+// to 18-bit for the sum. DAC at unity gain (subjectively balanced).
+// MAME reference: AY=0.30 per voice (x3 = 0.90), DAC=0.25 — i.e. DAC
+// quieter than the AY total. Unity gain here is close to that ratio.
 wire signed [17:0] dac_18 = {dac_dcrm[15], dac_dcrm[15], dac_dcrm};
 wire signed [17:0] mix    = ayA_dcrm + ayB_dcrm + ayC_dcrm + dac_18;
 

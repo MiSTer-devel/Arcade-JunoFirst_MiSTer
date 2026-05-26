@@ -384,10 +384,16 @@ always @(posedge CLK_50M) begin
 	end
 end
 
-// FIX-2026-05-25: ioctl_download + PLL locks in the reset chain — proper
-// cold-boot guard so the 8039 (and Z80) aren't released while ROMs are
-// still streaming into BRAM or before PLLs are settled. See Common-Pitfalls/
-// Core reset must include ioctl_download.md.
+// Reset chain — holds all modules in reset until ROMs have finished
+// streaming into BRAM (ioctl_download deasserts) and both PLLs are locked
+// (~snd_pll_locked / ~locked clear). Without ioctl_download here, CPUs
+// would execute against partial / zero / garbage ROM bytes during the
+// load window and could latch into bad state. See Common-Pitfalls/Core
+// reset must include ioctl_download.md.
+//
+// Note: this reset chain alone is NOT sufficient for the 8039 sound MCU —
+// it needs an additional ~10 s cold-boot hold from the walker FSM in
+// JunoFirst_SND.sv. See the workaround comment there.
 wire reset = RESET | status[0] | buttons[1] | ioctl_download | ~snd_pll_locked | ~locked;
 
 ///////////////////         Keyboard           //////////////////
