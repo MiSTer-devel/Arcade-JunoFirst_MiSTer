@@ -3,3 +3,4 @@ Claude/
 db/
 incremental_db/
 output_files/
+.token-savior-cache.json
