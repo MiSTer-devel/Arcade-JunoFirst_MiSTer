@@ -4,8 +4,10 @@ set_global_assignment -name SYSTEMVERILOG_FILE Arcade-JunoFirst.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/JunoFirst.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/JunoFirst_CPU.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/JunoFirst_SND.sv
-set_global_assignment -name VERILOG_FILE rtl/pause.v
-set_global_assignment -name VERILOG_FILE rtl/hiscore.v
+set_global_assignment -name VERILOG_FILE rtl/mister_custom/pause.v
+set_global_assignment -name VERILOG_FILE rtl/mister_custom/hiscore.v
+# CTL-2026-10-25: shared input library (controllers.sv v2)
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister_custom/controllers.sv
 set_global_assignment -name VERILOG_FILE rtl/jtframe_frac_cen.v
 set_global_assignment -name QIP_FILE rtl/cpu/jf_cpu.qip
 set_global_assignment -name QIP_FILE rtl/custom/jf_custom.qip

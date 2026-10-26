@@ -246,42 +246,61 @@ wire reset = RESET | status[0] | buttons[1] | ioctl_download | ~snd_pll_locked |
 
 ///////////////////         Keyboard           //////////////////
 
-reg btn_up       = 0;
-reg btn_down     = 0;
-reg btn_left     = 0;
-reg btn_right    = 0;
-reg btn_fire     = 0;
-reg btn_warp	 = 0;
-reg btn_coin1    = 0;
-reg btn_coin2    = 0;
-reg btn_1p_start = 0;
-reg btn_2p_start = 0;
-reg btn_pause    = 0;
-reg btn_service  = 0;
-
-wire pressed = ps2_key[9];
-wire [7:0] code = ps2_key[7:0];
-always @(posedge CLK_49M) begin
-	reg old_state;
-	old_state <= ps2_key[10];
-	if(old_state != ps2_key[10]) begin
-		case(code)
-			'h16: btn_1p_start <= pressed; // 1
-			'h1E: btn_2p_start <= pressed; // 2
-			'h2E: btn_coin1    <= pressed; // 5
-			'h36: btn_coin2    <= pressed; // 6
-			'h46: btn_service  <= pressed; // 9
-			'h4D: btn_pause    <= pressed; // P
-
-			'h75: btn_up      <= pressed; // up
-			'h72: btn_down    <= pressed; // down
-			'h6B: btn_left    <= pressed; // left
-			'h74: btn_right   <= pressed; // right
-			'h14: btn_fire    <= pressed; // ctrl
-			'h11: btn_warp    <= pressed; // alt			
-		endcase
-	end
-end
+// CTL-2026-10-25: keyboard -> controllers.sv ctl_keyboard (same keys, already on press); the instance sits after
+// pause_cpu below. Original commented out below.
+// reg btn_up       = 0;
+// reg btn_down     = 0;
+// reg btn_left     = 0;
+// reg btn_right    = 0;
+// reg btn_fire     = 0;
+// reg btn_warp	 = 0;
+// reg btn_coin1    = 0;
+// reg btn_coin2    = 0;
+// reg btn_1p_start = 0;
+// reg btn_2p_start = 0;
+// reg btn_pause    = 0;
+// reg btn_service  = 0;
+//
+// wire pressed = ps2_key[9];
+// wire [7:0] code = ps2_key[7:0];
+// always @(posedge CLK_49M) begin
+// 	reg old_state;
+// 	old_state <= ps2_key[10];
+// 	if(old_state != ps2_key[10]) begin
+// 		case(code)
+// 			'h16: btn_1p_start <= pressed; // 1
+// 			'h1E: btn_2p_start <= pressed; // 2
+// 			'h2E: btn_coin1    <= pressed; // 5
+// 			'h36: btn_coin2    <= pressed; // 6
+// 			'h46: btn_service  <= pressed; // 9
+// 			'h4D: btn_pause    <= pressed; // P
+//
+// 			'h75: btn_up      <= pressed; // up
+// 			'h72: btn_down    <= pressed; // down
+// 			'h6B: btn_left    <= pressed; // left
+// 			'h74: btn_right   <= pressed; // right
+// 			'h14: btn_fire    <= pressed; // ctrl
+// 			'h11: btn_warp    <= pressed; // alt			
+// 		endcase
+// 	end
+// end
+// kb: [0] up [1] down [2] left [3] right [4] Ctrl [5] Alt [6] 1 [7] 2 [8] 5 [9] 6 [10] 9 [11] T [12] P
+/* verilator lint_off UNUSED */
+wire [12:0] kb;                     // T is not used on this board
+wire        kbx_unused;
+/* verilator lint_on UNUSED */
+wire btn_up       = kb[0];
+wire btn_down     = kb[1];
+wire btn_left     = kb[2];
+wire btn_right    = kb[3];
+wire btn_fire     = kb[4];
+wire btn_warp     = kb[5];
+wire btn_coin1    = kb[8];
+wire btn_coin2    = kb[9];
+wire btn_1p_start = kb[6];
+wire btn_2p_start = kb[7];
+wire btn_pause    = kb[12];
+wire btn_service  = kb[10];
 
 //////////////////  Arcade Buttons/Interfaces   ///////////////////////////
 
@@ -310,6 +329,8 @@ wire m_pause    = btn_pause    | joystick_0[9];   // L shoulder (handled by fram
 
 // PAUSE SYSTEM
 wire pause_cpu;
+// CTL-2026-10-25: keyboard (see Keyboard above); held keys keep tracking while paused
+ctl_keyboard u_kb(.clk(CLK_49M), .ps2_key(ps2_key), .pause(pause_cpu), .kb(kb), .kbx(kbx_unused));
 wire [23:0] rgb_out;
 pause #(8,8,8,49) pause
 (

@@ -289,26 +289,58 @@ enddata_table(
 	.q_b(end_val)
 );
 
-// RAM chunk used to store valid hiscore data 
-dpram_hs #(.aWidth(HS_SCOREWIDTH),.dWidth(8))
+// HS-RAM-REVERT-2026-10-23: original dpram_hs instances commented out below, uncomment to restore
+// (Quartus built both from ~4k registers, ~3.3k ALMs, never M10K; the write-through q is never consumed)
+// // RAM chunk used to store valid hiscore data
+// dpram_hs #(.aWidth(HS_SCOREWIDTH),.dWidth(8))
+// hiscore_data (
+// 	.clk(clk),
+// 	.addr_a(ioctl_addr[(HS_SCOREWIDTH-1):0]),
+// 	.we_a(downloading_dump),
+// 	.d_a(data_from_hps),
+// 	.addr_b(data_addr),
+// 	.we_b(dump_write),
+// 	.d_b(hiscore_buffer_out),
+// 	.q_b(hiscore_data_out)
+// );
+// // RAM chunk used to store temporary high score data
+// dpram_hs #(.aWidth(HS_SCOREWIDTH),.dWidth(8))
+// hiscore_buffer (
+// 	.clk(clk),
+// 	.addr_a(buffer_addr),
+// 	.we_a(buffer_write),
+// 	.d_a(data_from_ram),
+// 	.q_a(hiscore_buffer_out)
+// );
+
+// HS-RAM-2026-10-23: same RAMs as explicit altsyncram (dpram_dc), 1-clock read latency as before
+// RAM chunk used to store valid hiscore data
+dpram_dc #(.widthad_a(HS_SCOREWIDTH), .width_a(8))
 hiscore_data (
-	.clk(clk),
-	.addr_a(ioctl_addr[(HS_SCOREWIDTH-1):0]),
-	.we_a(downloading_dump),
-	.d_a(data_from_hps),
-	.addr_b(data_addr),
-	.we_b(dump_write), 
-	.d_b(hiscore_buffer_out),
+	.clock_a(clk),
+	.address_a(ioctl_addr[(HS_SCOREWIDTH-1):0]),
+	.wren_a(downloading_dump),
+	.data_a(data_from_hps),
+	.q_a(),
+	.clock_b(clk),
+	.address_b(data_addr),
+	.wren_b(dump_write),
+	.data_b(hiscore_buffer_out),
 	.q_b(hiscore_data_out)
 );
 // RAM chunk used to store temporary high score data
-dpram_hs #(.aWidth(HS_SCOREWIDTH),.dWidth(8))
+dpram_dc #(.widthad_a(HS_SCOREWIDTH), .width_a(8))
 hiscore_buffer (
-	.clk(clk),
-	.addr_a(buffer_addr),
-	.we_a(buffer_write),
-	.d_a(data_from_ram),
-	.q_a(hiscore_buffer_out)
+	.clock_a(clk),
+	.address_a(buffer_addr),
+	.wren_a(buffer_write),
+	.data_a(data_from_ram),
+	.q_a(hiscore_buffer_out),
+	.clock_b(clk),
+	.address_b({HS_SCOREWIDTH{1'b0}}),
+	.wren_b(1'b0),
+	.data_b(8'd0),
+	.q_b()
 );
 
 assign data_to_ram = hiscore_data_out;
